@@ -1,7 +1,7 @@
 (ns clojure-lsp.feature.workspace-symbols
   (:require
-   [anonimitoraf.clj-flx :as flx]
    [clojure-lsp.feature.document-symbol :as f.document-symbol]
+   [clojure-lsp.fuzzy-score :as fuzzy-score]
    [clojure-lsp.queries :as q]
    [clojure-lsp.shared :as shared]
    [clojure.string :as string]))
@@ -12,7 +12,7 @@
   (let [query (string/lower-case query)]
     (->> col
          (keep (fn [doc]
-                 (when-let [score (flx/score query (string/lower-case (name (get-against doc))))]
+                 (when-let [score (fuzzy-score/score query (string/lower-case (name (get-against doc))))]
                    {:data doc
                     :score score})))
          (sort-by :score (comp - compare))
