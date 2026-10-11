@@ -8,7 +8,7 @@
 
 (defn- items [db prefix]
   (vec (#'completion/with-java-definition-items
-         #(string/starts-with? % prefix) prefix db)))
+        #(string/starts-with? % prefix) prefix db)))
 
 (deftest candidate-index-test
   (let [a {:class "java.lang.String"}
