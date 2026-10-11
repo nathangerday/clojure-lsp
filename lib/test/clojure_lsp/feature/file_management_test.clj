@@ -1,6 +1,11 @@
 (ns clojure-lsp.feature.file-management-test
   (:require
+   [clojure-lsp.clj-depend :as depend]
+   [clojure-lsp.feature.diagnostics :as diagnostics]
+   [clojure-lsp.feature.diagnostics.built-in :as built-in]
+   [clojure-lsp.feature.diagnostics.custom :as custom]
    [clojure-lsp.feature.file-management :as f.file-management]
+   [clojure-lsp.kondo :as kondo]
    [clojure-lsp.shared :as shared]
    [clojure-lsp.test-helper.internal :as h]
    [clojure.core.async :as async]
@@ -8,6 +13,60 @@
    [medley.core :as medley]))
 
 (h/reset-components-before-test)
+
+(deftest analysis-retry-reuses-only-unchanged-inputs
+  (doseq [[label update-db expected-runs]
+          [["unrelated bookkeeping" #(assoc % :progress :updated) 1]
+           ["another document edit" #(assoc-in % [:documents "other" :text] "[2]") 1]
+           ["settings change" #(assoc-in % [:settings :analysis :keywords] false) 2]
+           ["dependency analysis change" #(assoc-in % [:analysis "other" :var-definitions] [{:name 'changed}]) 2]]]
+    (testing label
+      (h/reset-components!)
+      (let [uri h/default-uri
+            db* (h/db*)
+            runs* (atom 0)
+            depend-runs* (atom 0)
+            diagnostics-states* (atom [])]
+        (swap! db* assoc-in [:documents uri] {:text "[1]" :v 1})
+        (with-redefs [kondo/run-kondo-on-text! (fn [_ _ snapshot*]
+                                                 (when (= 1 (swap! runs* inc))
+                                                   (is (= "[1]" (get-in @snapshot* [:documents uri :text])))
+                                                   (swap! db* update-db))
+                                                 {:analysis {uri {}} :findings {uri []}})
+                      depend/analyze-uri! (fn [_ _] (swap! depend-runs* inc) nil)
+                      built-in/analyze-uri! (fn [_ state]
+                                              (swap! diagnostics-states* conj (:progress state))
+                                              {})
+                      custom/analyze-uri! (fn [_ _] {})
+                      diagnostics/publish-diagnostics! (fn [_ _])
+                      f.file-management/notify-references (fn [& _])]
+          (f.file-management/analyze-changes {:uri uri :text "[1]" :version 1} (h/components)))
+        (is (= expected-runs @runs*))
+        (is (= expected-runs @depend-runs*))
+        (is (= 2 (count @diagnostics-states*)))
+        (is (= 1 (get-in @db* [:documents uri :analyzed-version])))
+        (when (= label "unrelated bookkeeping")
+          (is (= [nil :updated] @diagnostics-states*))
+          (is (= :updated (:progress @db*))))))))
+
+(deftest analysis-retry-abandons-stale-text
+  (doseq [new-version [0 2]]
+    (h/reset-components!)
+    (let [uri h/default-uri
+          db* (h/db*)
+          published* (atom 0)]
+      (swap! db* assoc-in [:documents uri] {:text "[1]" :v 0 :analyzed-version -1})
+      (with-redefs [kondo/run-kondo-on-text! (fn [& _]
+                                               (swap! db* assoc-in [:documents uri] {:text "[2]" :v new-version :analyzed-version -1})
+                                               {:analysis {uri {}} :findings {uri []}})
+                    depend/analyze-uri! (fn [& _])
+                    built-in/analyze-uri! (fn [& _] {})
+                    custom/analyze-uri! (fn [& _] {})
+                    diagnostics/publish-diagnostics! (fn [& _] (swap! published* inc))]
+        (f.file-management/analyze-changes {:uri uri :text "[1]" :version 0} (h/components)))
+      (is (zero? @published*))
+      (is (= -1 (get-in @db* [:documents uri :analyzed-version])))
+      (is (= "[2]" (get-in @db* [:documents uri :text]))))))
 
 (deftest opening-resets-analysis-version
   (let [uri h/default-uri]
