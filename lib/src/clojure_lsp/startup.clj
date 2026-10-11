@@ -6,6 +6,7 @@
    [clojure-lsp.db :as db]
    [clojure-lsp.feature.diagnostics.built-in :as f.diagnostics.built-in]
    [clojure-lsp.feature.diagnostics.custom :as f.diagnostics.custom]
+   [clojure-lsp.java-completion-index :as java-completion-index]
    [clojure-lsp.kondo :as lsp.kondo]
    [clojure-lsp.logger :as logger]
    [clojure-lsp.producer :as producer]
@@ -297,6 +298,7 @@
                            ;; this analysis, reuse them instead of replaying refresh-analysis.
                            (-> state-db
                                (update :analysis merge analysis)
+                               (java-completion-index/refresh (:analysis state-db) (keys analysis))
                                (assoc :dep-graph cached-dep-graph)
                                (update :documents merge (:documents db-cache)))
                            (lsp.kondo/db-with-analysis state-db {:analysis analysis

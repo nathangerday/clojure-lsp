@@ -8,6 +8,7 @@
    [clojure-lsp.feature.format]
    [clojure-lsp.feature.hover :as f.hover]
    [clojure-lsp.feature.java-interop :as f.java-interop]
+   [clojure-lsp.java-completion-index :as java-completion-index]
    [clojure-lsp.parser :as parser]
    [clojure-lsp.queries :as q]
    [clojure-lsp.refactor.edit :as edit]
@@ -529,7 +530,6 @@
     (flatten
       (into []
             (comp
-              q/xf-analysis->java-class-definitions
               (keep (fn [{:keys [class] :as e}]
                       (let [class-name* (delay (java-element->class-name e))]
                         (cond-> []
@@ -545,7 +545,9 @@
                                  :detail class
                                  :kind :class
                                  :priority :java-class-definitions}))))))
-            (:analysis db)))))
+            (java-completion-index/candidates db (first (if (symbol? cursor-value)
+                                                          (name cursor-value)
+                                                          (str cursor-value))))))))
 
 (defn ^:private with-java-static-member-definition-items [matches-fn class-name cursor-value db]
   (let [full-package? (string/includes? cursor-value ".")
