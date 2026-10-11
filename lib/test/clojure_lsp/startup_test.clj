@@ -1,16 +1,21 @@
 (ns clojure-lsp.startup-test
   (:require
    [babashka.fs :as fs]
+   [clojure-lsp.classpath :as classpath]
    [clojure-lsp.clj-depend :as lsp.depend]
+   [clojure-lsp.config :as config]
    [clojure-lsp.db :as db]
    [clojure-lsp.dep-graph :as dep-graph]
+   [clojure-lsp.feature.completion :as completion]
    [clojure-lsp.feature.diagnostics.built-in :as f.diagnostics.built-in]
    [clojure-lsp.feature.diagnostics.custom :as f.diagnostics.custom]
    [clojure-lsp.kondo :as lsp.kondo]
    [clojure-lsp.settings :as lsp.settings]
    [clojure-lsp.shared :as shared]
    [clojure-lsp.startup :as startup]
+   [clojure-lsp.test-helper.internal :as h]
    [clojure.java.io :as io]
+   [clojure.string :as string]
    [clojure.test :refer [are deftest is testing]]))
 
 (deftest cache-safe-findings-test
@@ -70,6 +75,40 @@
           (#'startup/load-db-cache! "/project" db*)
           (is (true? (:rebuilt? @db*)))
           (is (= analysis (:analysis @db*))))))))
+
+(deftest dependency-scheme-change-resets-java-candidates-test
+  (h/reset-components!)
+  (let [components (h/components)
+        db* (:db* components)
+        old-uri "jar:file:///removed.jar!/Gone.class"
+        new-uri "zipfile:///current.jar::New.class"
+        cache {:project-analysis-type :project-and-full-dependencies
+               :dependency-scheme "jar"
+               :analysis {old-uri {:java-class-definitions [{:class "review.Gone" :uri old-uri}]}}
+               :dep-graph {} :documents {} :classpath []}]
+    (swap! db* assoc :project-analysis-type :project-and-full-dependencies)
+    (with-redefs [config/resolve-for-root (fn [_] {})
+                  startup/publish-task-progress (fn [& _])
+                  startup/ensure-kondo-config-dir-exists! (fn [& _])
+                  db/read-local-cache (fn [& _] cache)
+                  classpath/project-specs->hash (fn [& _] "hash")
+                  config/settings-hash (fn [& _] "hash")
+                  lsp.kondo/config-hash (fn [& _] "hash")
+                  classpath/scan-classpath! (fn [& _] [])
+                  startup/copy-configs-from-classpath! (fn [& _])
+                  startup/analyze-external-classpath! (fn [& _]
+                                                        (swap! db* lsp.kondo/db-with-analysis
+                                                               {:analysis {new-uri {:java-class-definitions [{:class "review.New" :uri new-uri}]}}
+                                                                :external? true}))
+                  startup/analyze-source-paths! (fn [& _] true)
+                  startup/upsert-db-cache! (fn [& _])]
+      (startup/initialize-project "file:///review-project" {} {:dependency-scheme "zipfile" :source-paths []} {} nil components))
+    (let [items (fn [state] (vec (#'completion/with-java-definition-items
+                                  #(string/starts-with? % "review.") "review." state)))]
+      (is (= #{new-uri} (set (keys (:analysis @db*)))))
+      (is (= ["review.New"] (mapv :label (items @db*))))
+      (is (= (items (dissoc @db* :java-completion-index)) (items @db*)))))
+  (h/reset-components!))
 
 (deftest db-without-uris-test
   (let [uri "file:///a.clj"
