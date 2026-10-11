@@ -267,33 +267,57 @@
     new-version
     old-version))
 
+(defn- analysis-inputs [db]
+  {:settings (settings/all db)
+   :project-root-uri (:project-root-uri db)
+   :kondo-config (:kondo-config db)
+   :kondo-config-hash (:kondo-config-hash db)
+   :classpath (:classpath db)
+   :analysis (:analysis db)})
+
+(defn- same-analysis-inputs? [a b]
+  ;; Compare the potentially huge analysis by identity: a dependency/source
+  ;; analysis change conservatively requires a fresh run. Cursor, progress,
+  ;; document bookkeeping and other unrelated updates do not.
+  (and (identical? (:analysis a) (:analysis b))
+       (= (dissoc a :analysis) (dissoc b :analysis))))
+
 (defn analyze-changes [{:keys [uri text version]} {:keys [producer db*] :as components}]
-  (loop [state-db @db*]
-    (when (>= version (get-in state-db [:documents uri :v] -1))
-      (let [kondo-result* (future
-                            (shared/logging-task
-                              :internal/uri-analyzed-by-clj-kondo
-                              (lsp.kondo/run-kondo-on-text! text uri db*)))
-            depend-result* (future
-                             (shared/logging-task
-                               :internal/uri-analyzed-by-clj-depend
-                               (lsp.depend/analyze-uri! uri state-db)))
-            kondo-result @kondo-result*
-            depend-result @depend-result*
-            old-db @db*]
-        (if (compare-and-set! db* state-db
-                              (-> state-db
-                                  (lsp.kondo/db-with-results kondo-result)
-                                  (lsp.depend/db-with-results depend-result)
-                                  (f.diagnostics.built-in/db-with-results #(f.diagnostics.built-in/analyze-uri! uri %))
-                                  (f.diagnostics.custom/db-with-results #(f.diagnostics.custom/analyze-uri! uri %))
-                                  (update-in [:documents uri :analyzed-version]
-                                             bump-version version)))
-          (let [db @db*]
-            (f.diagnostic/publish-diagnostics! uri components)
-            (notify-references uri old-db db components)
-            (producer/refresh-test-tree producer [uri]))
-          (recur @db*))))))
+  (loop [state-db @db* previous-inputs nil previous-results nil]
+    (let [document (get-in state-db [:documents uri])]
+      (when (and (>= version (get document :v -1))
+                 (or (nil? (:text document)) (= text (:text document))))
+        (let [inputs (analysis-inputs state-db)
+              reusable? (and previous-results (same-analysis-inputs? inputs previous-inputs))
+              snapshot* (atom state-db)
+              kondo-result* (if reusable?
+                              (delay (:kondo previous-results))
+                              (future
+                                (shared/logging-task
+                                  :internal/uri-analyzed-by-clj-kondo
+                                  (lsp.kondo/run-kondo-on-text! text uri snapshot*))))
+              depend-result* (if reusable?
+                               (delay (:depend previous-results))
+                               (future
+                                 (shared/logging-task
+                                   :internal/uri-analyzed-by-clj-depend
+                                   (lsp.depend/analyze-uri! uri state-db))))
+              kondo-result @kondo-result*
+              depend-result @depend-result*
+              old-db @db*]
+          (if (compare-and-set! db* state-db
+                                (-> state-db
+                                    (lsp.kondo/db-with-results kondo-result)
+                                    (lsp.depend/db-with-results depend-result)
+                                    (f.diagnostics.built-in/db-with-results #(f.diagnostics.built-in/analyze-uri! uri %))
+                                    (f.diagnostics.custom/db-with-results #(f.diagnostics.custom/analyze-uri! uri %))
+                                    (update-in [:documents uri :analyzed-version]
+                                               bump-version version)))
+            (let [db @db*]
+              (f.diagnostic/publish-diagnostics! uri components)
+              (notify-references uri old-db db components)
+              (producer/refresh-test-tree producer [uri]))
+            (recur @db* inputs {:kondo kondo-result :depend depend-result})))))))
 
 (defn did-change [uri changes version {:keys [db* current-changes-chan]}]
   (let [old-text (get-in @db* [:documents uri :text])
