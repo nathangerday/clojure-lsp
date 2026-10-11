@@ -423,6 +423,7 @@
                    :kondo-config-hash kondo-config-hash
                    :analysis-checksums (if dependency-scheme-changed? nil (:analysis-checksums @db*))
                    :analysis (if dependency-scheme-changed? nil (:analysis @db*))
+                   :java-completion-index (if dependency-scheme-changed? nil (:java-completion-index @db*))
                    :dependency-scheme dependency-scheme
                    :classpath classpath
                    :settings (update settings :source-paths (partial source-paths/process-source-paths settings root-path classpath)))
