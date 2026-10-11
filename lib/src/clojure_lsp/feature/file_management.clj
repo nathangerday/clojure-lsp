@@ -3,7 +3,6 @@
    [babashka.fs :as fs]
    [clojure-lsp.clj-depend :as lsp.depend]
    [clojure-lsp.config :as config]
-   [clojure-lsp.dep-graph :as dep-graph]
    [clojure-lsp.feature.completion-lib :as f.completion-lib]
    [clojure-lsp.feature.diagnostics :as f.diagnostic]
    [clojure-lsp.feature.diagnostics.built-in :as f.diagnostics.built-in]
@@ -305,11 +304,7 @@
                                      :version version})))
 
 (defn ^:private db-without-uri [state-db uri]
-  (-> state-db
-      (dep-graph/remove-doc uri)
-      (shared/dissoc-in [:documents uri])
-      (shared/dissoc-in [:analysis uri])
-      (shared/dissoc-in [:diagnostics :clj-kondo uri])))
+  (lsp.kondo/db-without-uris state-db [uri]))
 
 (defn ^:private files-deleted [old-db {:keys [db*] :as components} uris]
   (swap! db* #(reduce db-without-uri % uris))

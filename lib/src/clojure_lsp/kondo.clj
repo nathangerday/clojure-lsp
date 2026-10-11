@@ -4,6 +4,7 @@
    [clj-kondo.core :as kondo]
    [clojure-lsp.config :as config]
    [clojure-lsp.dep-graph :as dep-graph]
+   [clojure-lsp.java-completion-index :as java-completion-index]
    [clojure-lsp.logger :as logger]
    [clojure-lsp.settings :as settings]
    [clojure-lsp.shared :as shared]
@@ -105,6 +106,7 @@
   [db {:keys [analysis external?]} merge-analysis]
   (-> db
       (update :analysis merge-analysis analysis)
+      (java-completion-index/refresh (:analysis db) (keys analysis))
       ;; Whenever the analysis is updated, we refresh the dep graph. This is the
       ;; only place this is done, so to keep the dep graph in sync with the
       ;; analysis, everything that puts analysis in the db must either call this
@@ -139,14 +141,16 @@
   "Remove the given `uris` from the analysis, dep-graph, documents and kondo
   diagnostics, keeping the dep-graph in sync."
   [db uris]
-  (reduce (fn [db uri]
-            (-> db
-                (dep-graph/remove-doc uri)
-                (shared/dissoc-in [:documents uri])
-                (shared/dissoc-in [:analysis uri])
-                (shared/dissoc-in [:diagnostics :clj-kondo uri])))
-          db
-          uris))
+  (let [old-analysis (:analysis db)]
+    (-> (reduce (fn [db uri]
+                  (-> db
+                      (dep-graph/remove-doc uri)
+                      (shared/dissoc-in [:documents uri])
+                      (shared/dissoc-in [:analysis uri])
+                      (shared/dissoc-in [:diagnostics :clj-kondo uri])))
+                db
+                uris)
+        (java-completion-index/refresh old-analysis uris))))
 
 (defn ^:private element-with-fallback-name-position [element]
   (assoc element
