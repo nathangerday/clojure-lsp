@@ -58,6 +58,35 @@
           (is (every? #(identical? (first roots) %) roots))))))
   (parser/clear-document-cache!))
 
+(deftest reopened-document-parsing-test
+  (parser/clear-document-cache!)
+  (let [uri "file:///reopened-cache.clj"
+        state (fn [text version session]
+                {:documents {uri {:text text :v version :open-session session}}})
+        old (state "[old]" 100 (parser/start-document-cache! uri))
+        parse parser/z-of-string*
+        calls* (atom 0)]
+    (parser/zloc-of-file old uri)
+    (parser/clear-document-cache! uri)
+    (let [new (state "[new]" 0 (parser/start-document-cache! uri))]
+      (with-redefs [parser/z-of-string* (fn [text] (swap! calls* inc) (parse text))]
+        (testing "late snapshots do not repopulate the new session before its first request"
+          (is (= "[old]" (z/root-string (parser/zloc-of-file old uri))))
+          (is (nil? (get @@#'parser/roots* uri))))
+        (let [root (parser/zloc-of-file new uri)]
+          (is (= "[new]" (z/root-string root)))
+          (dotimes [_ 5] (is (identical? root (parser/zloc-of-file new uri))))
+          (is (= 2 @calls*))
+          (testing "late snapshots do not replace an already-cached new session"
+            (is (= "[old]" (z/root-string (parser/zloc-of-file old uri))))
+            (is (identical? root (parser/zloc-of-file new uri)))
+            (is (= "[new]" (get-in @@#'parser/roots* [uri :text]))))
+          (testing "close prevents late requests from retaining a closed document"
+            (parser/clear-document-cache! uri)
+            (is (= "[new]" (z/root-string (parser/zloc-of-file new uri))))
+            (is (nil? (get @@#'parser/roots* uri))))))))
+  (parser/clear-document-cache!))
+
 (deftest bounded-document-parsing-test
   (parser/clear-document-cache!)
   (with-redefs [parser/max-cached-documents 2
