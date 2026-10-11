@@ -106,9 +106,49 @@
     (catch Exception _e
       (logger/warn "It was not possible to parse text. Probably not valid clojure code."))))
 
+(def ^:private max-cached-documents 32)
+(def ^:private max-cached-characters 2000000)
+(defonce ^:private roots* (atom {}))
+
+(defn clear-document-cache!
+  "Release a document's parse tree on close/reopen, or all trees on shutdown."
+  ([] (reset! roots* {}))
+  ([uri] (swap! roots* dissoc uri)))
+
+(defn- bounded-roots [roots]
+  (loop [roots roots]
+    (if (or (> (count roots) max-cached-documents)
+            (> (reduce + 0 (map (comp count :text val) roots)) max-cached-characters))
+      (recur (dissoc roots (key (apply min-key (comp :access val) roots))))
+      roots)))
+
+(defn- cached-root [uri text version]
+  (let [root (locking roots*
+               (let [previous (get @roots* uri)
+                     root (if (= text (:text previous))
+                            (:root previous)
+                            (delay (zloc-of-string text)))]
+                 ;; An older snapshot remains valid for its own request, but
+                 ;; must not replace the tree already cached for a newer edit.
+                 (when (and (<= (count text) max-cached-characters)
+                            (or (nil? version) (nil? (:version previous))
+                                (>= version (:version previous))))
+                   (swap! roots* #(bounded-roots (assoc % uri {:text text :version version
+                                                               :root root :access (System/nanoTime)}))))
+                 root))]
+    (try
+      ;; Delay coalesces concurrent parses without retaining a DB snapshot.
+      @root
+      (catch Exception e
+        (swap! roots* #(if (identical? root (get-in % [uri :root])) (dissoc % uri) %))
+        (throw e)))))
+
 (defn zloc-of-file [db uri]
-  (zloc-of-string (or (get-in db [:documents uri :text])
-                      (shared/slurp-uri uri))))
+  (if-some [text (get-in db [:documents uri :text])]
+    (cached-root uri text (get-in db [:documents uri :v]))
+    ;; Disk-backed documents can change outside didChange; never reuse their
+    ;; trees without reading the current file.
+    (zloc-of-string (shared/slurp-uri uri))))
 
 (defn safe-zloc-of-file [db uri]
   (try

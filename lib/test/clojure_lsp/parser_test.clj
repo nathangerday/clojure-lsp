@@ -1,11 +1,73 @@
 (ns clojure-lsp.parser-test
   (:require
    [clojure-lsp.parser :as parser]
+   [clojure-lsp.shared :as shared]
    [clojure-lsp.test-helper.internal :as h]
    [clojure.test :refer [are deftest is testing]]
    [rewrite-clj.zip :as z]))
 
 (h/reset-components-before-test)
+
+(deftest shared-document-parsing-test
+  (parser/clear-document-cache!)
+  (let [uri "file:///parse-cache.clj"
+        state (fn [text version] {:documents {uri {:text text :v version}}})
+        old (state "[1]" 1)
+        new (state "[2]" 2)
+        first-root (parser/zloc-of-file old uri)
+        new-root (parser/zloc-of-file new uri)]
+    (is (identical? new-root (parser/zloc-of-file new uri)))
+    (is (= "[1]" (z/root-string (parser/zloc-of-file old uri))))
+    (is (identical? new-root (parser/zloc-of-file new uri)))
+    (is (= "[1]" (z/root-string first-root)))
+    (parser/clear-document-cache! uri)
+    (is (= "[3]" (z/root-string (parser/zloc-of-file (state "[3]" 0) uri))))
+    (doseq [text ["foo/ " "(:)" "[:foo/]" "(::foo/)"]]
+      (parser/clear-document-cache! uri)
+      (is (= text (z/root-string (parser/zloc-of-file (state text 0) uri)))))
+    (testing "failed parses are not retained"
+      (is (thrown? Exception (parser/zloc-of-file (state "[" 1) uri)))
+      (is (nil? (get @@#'parser/roots* uri)))
+      (is (= "[4]" (z/root-string (parser/zloc-of-file (state "[4]" 2) uri)))))
+    (testing "disk-backed text is reread"
+      (let [text* (atom "[5]")]
+        (with-redefs [shared/slurp-uri (fn [_] @text*)]
+          (is (= "[5]" (z/root-string (parser/zloc-of-file {} uri))))
+          (reset! text* "[6]")
+          (is (= "[6]" (z/root-string (parser/zloc-of-file {} uri))))))))
+  (parser/clear-document-cache!))
+
+(deftest concurrent-document-parsing-test
+  (parser/clear-document-cache!)
+  (let [calls* (atom 0)
+        started (promise)
+        release (promise)
+        parse parser/z-of-string*
+        uri "file:///coalesced.clj"
+        db {:documents {uri {:text "[1 2 3]" :v 1}}}]
+    (with-redefs [parser/z-of-string* (fn [text]
+                                        (swap! calls* inc)
+                                        (deliver started true)
+                                        (deref release 5000 false)
+                                        (parse text))]
+      (let [requests (doall (repeatedly 8 #(future (parser/zloc-of-file db uri))))]
+        (is (true? (deref started 5000 false)))
+        (deliver release true)
+        (let [roots (mapv #(deref % 5000 ::timeout) requests)]
+          (is (= 1 @calls*))
+          (is (every? #(identical? (first roots) %) roots))))))
+  (parser/clear-document-cache!))
+
+(deftest bounded-document-parsing-test
+  (parser/clear-document-cache!)
+  (with-redefs [parser/max-cached-documents 2
+                parser/max-cached-characters 10]
+    (doseq [uri ["a" "b" "c"]]
+      (parser/zloc-of-file {:documents {uri {:text "[1]"}}} uri))
+    (is (= #{"b" "c"} (set (keys @@#'parser/roots*))))
+    (parser/zloc-of-file {:documents {"d" {:text "[1 2 3 4 5]"}}} "d")
+    (is (not (contains? @@#'parser/roots* "d"))))
+  (parser/clear-document-cache!))
 
 (deftest safe-zloc-of-string
   (are [s] (= s (z/root-string (parser/safe-zloc-of-string s)))

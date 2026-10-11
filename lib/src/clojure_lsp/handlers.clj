@@ -221,6 +221,7 @@
 (defn shutdown [{:keys [db*]}]
   (shared/logging-task
     :lsp/shutdown
+    (parser/clear-document-cache!)
     (reset! db* db/initial-db)
     nil))
 

@@ -9,6 +9,7 @@
    [clojure-lsp.feature.diagnostics.custom :as f.diagnostics.custom]
    [clojure-lsp.feature.rename :as f.rename]
    [clojure-lsp.kondo :as lsp.kondo]
+   [clojure-lsp.parser :as parser]
    [clojure-lsp.producer :as producer]
    [clojure-lsp.queries :as q]
    [clojure-lsp.settings :as settings]
@@ -32,6 +33,7 @@
         (shared/client-changes changes db)))))
 
 (defn load-document! [uri text db*]
+  (parser/clear-document-cache! uri)
   ;; Reset both versions when reopening too: cached analysis belongs to the
   ;; previous document session. A negative marker makes requests wait for open.
   (swap! db* update-in [:documents uri] assoc :v 0 :analyzed-version -1 :text text :saved-on-disk false))
@@ -354,6 +356,7 @@
         (files-deleted db components deleted)))))
 
 (defn did-close [uri {:keys [db*] :as components}]
+  (parser/clear-document-cache! uri)
   (let [db @db*
         filename (shared/uri->filename uri)
         source-paths (settings/get db [:source-paths])
