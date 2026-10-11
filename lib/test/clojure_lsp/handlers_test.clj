@@ -15,6 +15,60 @@
 
 (h/reset-components-before-test)
 
+(deftest first-edit-waits-for-analysis
+  (let [uri h/default-uri
+        changes-chan (async/chan 1)
+        components (assoc (h/components) :current-changes-chan changes-chan)
+        cancelled? (atom false)
+        components (assoc components :lsp4clj.server/req-cancelled? cancelled?)]
+    (h/load-code-and-locs "{:a 1}" uri)
+    (f.file-management/did-change uri [{:text "\n{:a 1}"}] 1 components)
+    (testing "both token providers wait after the first edit"
+      (let [full (future (handlers/semantic-tokens-full components {:text-document {:uri uri}}))
+            range (future (handlers/semantic-tokens-range components
+                                                          {:text-document {:uri uri}
+                                                           :range {:start {:line 0 :character 0}
+                                                                   :end {:line 2 :character 0}}}))]
+        (try
+          (is (= ::waiting (deref full 100 ::waiting)))
+          (is (= ::waiting (deref range 100 ::waiting)))
+          (f.file-management/analyze-changes (h/take-or-timeout changes-chan 500) components)
+          (is (= {:data [1 2 1 4 0]} (deref full 2000 ::timeout)))
+          (is (= {:data [1 2 1 4 0]} (deref range 2000 ::timeout)))
+          (finally
+            (reset! cancelled? true)
+            (future-cancel full)
+            (future-cancel range)))))))
+
+(deftest analysis-version-waiting-lifecycle
+  (let [uri h/default-uri]
+    (testing "unopened files can use cached analysis"
+      (is (#'handlers/caught-up? {} uri 0)))
+    (testing "opening analysis is pending until version zero is recorded"
+      (f.file-management/load-document! uri "{:a 1}" (h/db*))
+      (is (not (#'handlers/caught-up? (h/db) uri 0)))
+      (h/load-code-and-locs "{:a 1}" uri)
+      (is (#'handlers/caught-up? (h/db) uri 0)))
+    (testing "later edits still wait, and newer analysis satisfies older requests"
+      (swap! (h/db*) assoc-in [:documents uri :analyzed-version] 1)
+      (is (not (#'handlers/caught-up? (h/db) uri 2)))
+      (swap! (h/db*) assoc-in [:documents uri :analyzed-version] 3)
+      (is (#'handlers/caught-up? (h/db) uri 2)))
+    (testing "a cancelled first-edit request exits without applying old positions"
+      (h/load-code-and-locs "{:a 1}" uri)
+      (swap! (h/db*) assoc-in [:documents uri :v] 1)
+      (let [cancelled? (atom false)
+            components (assoc (h/components) :lsp4clj.server/req-cancelled? cancelled?)
+            request (future (handlers/semantic-tokens-full components {:text-document {:uri uri}}))]
+        (try
+          (is (= ::waiting (deref request 100 ::waiting)))
+          (reset! cancelled? true)
+          (is (= {:error {:code :request-cancelled :message "Request cancelled by client."}}
+                 (deref request 2000 ::timeout)))
+          (finally
+            (reset! cancelled? true)
+            (future-cancel request)))))))
+
 (defn- run-clean-ns-and-check-result
   ([input-code expected-code]
    (run-clean-ns-and-check-result input-code expected-code true))

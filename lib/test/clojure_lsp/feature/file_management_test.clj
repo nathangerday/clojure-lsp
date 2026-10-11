@@ -9,6 +9,15 @@
 
 (h/reset-components-before-test)
 
+(deftest opening-resets-analysis-version
+  (let [uri h/default-uri]
+    (swap! (h/db*) assoc-in [:documents uri :analyzed-version] 42)
+    (f.file-management/load-document! uri "{:a 1}" (h/db*))
+    (is (= -1 (get-in (h/db) [:documents uri :analyzed-version])))
+    (h/load-code-and-locs "{:a 1}" uri)
+    (is (= 0 (get-in (h/db) [:documents uri :v])))
+    (is (= 0 (get-in (h/db) [:documents uri :analyzed-version])))))
+
 (deftest update-text
   ;; line endings the same as those of the underlying system's.
   (is (= (h/lf->sys "(comment\n   )") (#'f.file-management/replace-text "(comment)" "\n   " 0 8 0 8)))

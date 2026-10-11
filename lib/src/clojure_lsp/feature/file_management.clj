@@ -33,7 +33,9 @@
         (shared/client-changes changes db)))))
 
 (defn load-document! [uri text db*]
-  (swap! db* update-in [:documents uri] assoc :v 0 :text text :saved-on-disk false))
+  ;; Reset both versions when reopening too: cached analysis belongs to the
+  ;; previous document session. A negative marker makes requests wait for open.
+  (swap! db* update-in [:documents uri] assoc :v 0 :analyzed-version -1 :text text :saved-on-disk false))
 
 (defn did-open [uri text {:keys [db* producer edits-chan] :as components} allow-create-ns]
   (load-document! uri text db*)
@@ -46,7 +48,8 @@
                      (lsp.kondo/db-with-results kondo-result)
                      (lsp.depend/db-with-results depend-result)
                      (f.diagnostics.built-in/db-with-results #(f.diagnostics.built-in/analyze-uri! uri %))
-                     (f.diagnostics.custom/db-with-results #(f.diagnostics.custom/analyze-uri! uri %)))))
+                     (f.diagnostics.custom/db-with-results #(f.diagnostics.custom/analyze-uri! uri %))
+                     (assoc-in [:documents uri :analyzed-version] 0))))
     (f.diagnostic/publish-diagnostics! uri components))
   (when allow-create-ns
     (when-let [create-ns-edits (create-ns-changes uri text @db*)]

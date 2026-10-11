@@ -25,22 +25,19 @@
 (defn ^:private symbol-order [{:keys [selection-range]}]
   [(:line (:start selection-range)) (:character (:start selection-range))])
 
-(defn ^:private remove-first [item-to-remove coll]
-  (if (empty? coll)
-    ()  ; literal name for empty list
-    (let [item (first coll)]
-      (if (= item item-to-remove)
-        (rest coll)
-        (cons (first coll) (lazy-seq (remove-first item-to-remove (rest coll))))))))
-
 (defn ^:private element-position [{:keys [row col]}]
   [row col])
 
-(defn ^:private find-first-by-position [pred coll]
-  (->> coll
-       (filter pred)
-       (sort-by element-position)
-       first))
+(defn ^:private index-elements [key-fn elements]
+  (into {}
+        (map (fn [[k matches]]
+               [k (seq (sort-by element-position matches))]))
+        (group-by key-fn elements)))
+
+(defn ^:private take-element! [elements* k]
+  (when-let [element (first (get @elements* k))]
+    (swap! elements* update k next)
+    element))
 
 (defn ^:private edn->element-tree [m keyword-elements* symbol-elements*]
   ;; TODO use tail recur for better performance
@@ -59,12 +56,10 @@
                :else
                (let [[k v] (vec entry)
                      element (or (if (keyword? k)
-                                   (find-first-by-position #(= (:name %) (name k)) @keyword-elements*)
-                                   (find-first-by-position #(= (:symbol %) k) @symbol-elements*))
+                                   (take-element! keyword-elements* (name k))
+                                   (take-element! symbol-elements* k))
                                  ;; fallback to dumb element
                                  {:symbol (or (some-> k str) "nil") :row 0 :col 0 :end-row 0 :end-col 0})
-                     _ (swap! keyword-elements* #(remove-first element %))
-                     _ (swap! symbol-elements* #(remove-first element %))
                      document-symbol (element->document-symbol element)
                      kind (cond
                             (string? v) :string
@@ -109,8 +104,8 @@
     (try
       (some-> (parser/safe-zloc-of-file db uri)
               parser/safe-zloc-sexpr
-              (edn->element-tree (atom (get-in db [:analysis uri :keyword-usages]))
-                                 (atom (get-in db [:analysis uri :symbols]))))
+              (edn->element-tree (atom (index-elements :name (get-in db [:analysis uri :keyword-usages])))
+                                 (atom (index-elements :symbol (get-in db [:analysis uri :symbols])))))
       (catch Exception e
         (logger/error e)))
     (->> (q/find-element-definitions db uri)

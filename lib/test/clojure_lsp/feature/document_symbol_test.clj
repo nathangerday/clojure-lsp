@@ -296,6 +296,41 @@
                  (h/db)
                  (h/file-uri "file:///a.edn"))))))))
 
+(deftest indexed-edn-key-positions
+  (let [uri (h/file-uri "file:///indexed.edn")
+        keyword-element (fn [row]
+                          {:name "key" :row row :col 3 :end-row row :end-col 7})
+        symbol-element (fn [row]
+                         {:symbol 'lib/key :row row :col 3 :end-row row :end-col 10})
+        db {:documents {uri {:text "[{:key 1}\n {:key 2}\n {lib/key 3}\n {lib/key 4}\n {\"missing\" 5}\n {nil 6}]"}}
+            :analysis {uri {:keyword-usages [(keyword-element 2) (keyword-element 1)]
+                            :symbols [(symbol-element 4) (symbol-element 3)]}}}
+        symbols (f.document-symbol/document-symbols db uri)]
+    (is (= ["missing" "nil" "key" "key" "lib/key" "lib/key"]
+           (mapv :name symbols)))
+    (is (= [0 0 0 1 2 3]
+           (mapv #(get-in % [:selection-range :start :line]) symbols)))
+    (is (= [0 0 2 2 2 2]
+           (mapv #(get-in % [:selection-range :start :character]) symbols)))
+    (testing "exhausted or absent analysis retains fallback symbols"
+      (is (= [":key" ":key" "lib/key" "lib/key" "missing" "nil"]
+             (mapv :name (f.document-symbol/document-symbols (dissoc db :analysis) uri)))))))
+
+(deftest many-edn-keys-with-fallbacks
+  (let [uri (h/file-uri "file:///many-keys.edn")
+        size 2000
+        text (str "[" (apply str (repeat size "{\"missing\" {:key 1}}\n")) "]")
+        db {:documents {uri {:text text}}
+            :analysis {uri {:keyword-usages
+                            (mapv (fn [row]
+                                    {:name "key" :row row :col 14 :end-row row :end-col 18})
+                                  (range 1 (inc size)))}}}
+        symbols (f.document-symbol/document-symbols db uri)]
+    (is (= size (count symbols)))
+    (is (every? #(= "missing" (:name %)) symbols))
+    (is (= (range size)
+           (map #(get-in (first (:children %)) [:selection-range :start :line]) symbols)))))
+
 (defspec edn-files 1000
   (properties/for-all [value (s/gen ::edn)]
     (h/load-code (str value) (h/file-uri "file:///a.edn"))
