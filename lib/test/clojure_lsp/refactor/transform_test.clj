@@ -2628,6 +2628,30 @@
 (defn suppress-diagnostic [code diagnostic-code]
   (h/with-strings (transform/suppress-diagnostic (h/zloc-from-code code) diagnostic-code)))
 
+(deftest nearby-condition-does-not-render-collections
+  (let [original-string z/string]
+    (doseq [[code near-if? near-cond?]
+            [["|{:data [1 2 3]}" false false]
+             ["{:data| [1 2 3]}" false false]
+             ["{:data [1 2 3]| :other 1}" false false]
+             ["|([1 2 3] 4)" false false]
+             ["|((if true 1 2) 3)" false false]
+             ["|[1 2 3] (if true 1 2)" true false]
+             ["|[1 2 3] (cond true 1)" false true]
+             ["(|if {:data [1 2 3]} 1 2)" true false]
+             ["(|cond {:data [1 2 3]} 1)" false true]
+             ["|\"if\"" false false]
+             ["|:cond" false false]
+             ["(foo/|if true 1 2)" false false]]]
+      (testing code
+        (let [loc (h/zloc-from-code code)]
+          (with-redefs [z/string (fn [zloc]
+                                   (when (contains? #{:forms :map :list :vector :set} (z/tag zloc))
+                                     (throw (ex-info "Rendered collection while checking operator name" {})))
+                                   (original-string zloc))]
+            (is (= near-if? (transform/near-if? loc)))
+            (is (= near-cond? (transform/near-cond? loc)))))))))
+
 (defn ^:private do-if->cond [code]
   (let [file-uri "file:///a.clj"
         zloc-start (h/load-code-and-zloc code file-uri)]

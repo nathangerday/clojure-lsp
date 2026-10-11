@@ -9,6 +9,7 @@
    [clojure-lsp.kondo :as lsp.kondo]
    [clojure-lsp.logger :as logger]
    [clojure-lsp.producer :as producer]
+   [clojure-lsp.settings :as lsp.settings]
    [clojure-lsp.shared :as shared]
    [clojure-lsp.source-paths :as source-paths]
    [clojure.core.async :as async]
@@ -94,8 +95,9 @@
   When `force-all?` is false (warm startup) only source files whose checksum
   changed since the cached run are re-analyzed with clj-kondo, files no longer
   on disk are evicted, and the cached analysis is reused for everything else.
-  The linters always run over the whole `paths`. Returns whether anything
-  changed, so the caller can decide whether to rewrite the cache."
+  Built-in diagnostics are reused when source files and settings are unchanged.
+  clj-depend and custom linters still run over the whole `paths`. Returns whether
+  any source files changed, so the caller can decide whether to rewrite the cache."
   [paths db* file-analyzed-fn force-all?]
   (let [current-files (enumerate-source-files paths)
         new-checksums (shared/paths->checksums current-files)
@@ -106,6 +108,7 @@
         deleted-uris (into [] (comp (remove current-files)
                                     (map #(shared/filename->uri % @db*)))
                            (keys cached-checksums))
+        source-changed? (boolean (or (seq files-to-analyze) (seq deleted-uris)))
         kondo-result* (future
                         (shared/logging-task
                           :internal/project-paths-analyzed-by-clj-kondo
@@ -123,14 +126,30 @@
         kondo-result @kondo-result*
         depend-result @depend-result*]
     (swap! db* (fn [state-db]
-                 (-> state-db
-                     (lsp.kondo/db-without-uris deleted-uris)
-                     (lsp.kondo/db-with-results kondo-result)
-                     (lsp.depend/db-with-results depend-result)
-                     (f.diagnostics.built-in/db-with-results analyze-built-in-fn)
-                     (f.diagnostics.custom/db-with-results custom-lint-fn)
-                     (assoc :source-paths-checksums new-checksums))))
-    (boolean (or (seq files-to-analyze) (seq deleted-uris)))))
+                 (let [state-db (-> state-db
+                                    (lsp.kondo/db-without-uris deleted-uris)
+                                    (lsp.kondo/db-with-results kondo-result)
+                                    (lsp.depend/db-with-results depend-result))
+                       settings-hash (config/settings-hash (lsp.settings/all state-db))
+                       cached-lint (:startup-built-in-lint-cache state-db)
+                       reuse-lint? (and (not force-all?)
+                                        (not source-changed?)
+                                        (= 1 (:version cached-lint))
+                                        (= settings-hash (:settings-hash cached-lint))
+                                        (map? (:findings cached-lint)))
+                       state-db (if reuse-lint?
+                                  (do
+                                    (logger/debug logger-tag "Reusing cached built-in project diagnostics")
+                                    (assoc-in state-db [:diagnostics :built-in] (:findings cached-lint)))
+                                  (f.diagnostics.built-in/db-with-results state-db analyze-built-in-fn))]
+                   (-> state-db
+                       (assoc :startup-built-in-lint-cache
+                              {:version 1
+                               :settings-hash settings-hash
+                               :findings (get-in state-db [:diagnostics :built-in])})
+                       (f.diagnostics.custom/db-with-results custom-lint-fn)
+                       (assoc :source-paths-checksums new-checksums)))))
+    source-changed?))
 
 (defn ^:private analyze-source-paths-namespaces-only! [paths db* _file-analyzed-fn]
   (let [db @db*
@@ -186,14 +205,47 @@
         (System/gc))
       (swap! db* assoc :full-scan-analysis-startup true))))
 
+(defn ^:private config-files [^File dir]
+  (when (.isDirectory dir)
+    (->> (tree-seq #(.isDirectory ^File %)
+                   #(remove (fn [^File file] (= ".cache" (.getName file)))
+                            (.listFiles ^File %))
+                   dir)
+         (filter #(.isFile ^File %)))))
+
+(defn ^:private copied-configs-signature [classpath settings db]
+  (let [root (shared/uri->filename (:project-root-uri db))
+        config-dir (io/file (or (:kondo-config-dir settings) (io/file root ".clj-kondo")))
+        files (concat (config-files config-dir)
+                      (mapcat (fn [path]
+                                (let [file (io/file path)]
+                                  (if (.isDirectory file)
+                                    (config-files (io/file file "clj-kondo.exports"))
+                                    [file])))
+                              classpath))]
+    {:config-dir (.getCanonicalPath config-dir)
+     :config-hash (lsp.kondo/config-hash root)
+     :classpath (vec classpath)
+     :files (into {} (map (fn [^File file]
+                            [(.getCanonicalPath file) [(.lastModified file) (.length file)]])) files)}))
+
 (defn ^:private copy-configs-from-classpath! [classpath settings db*]
   (when (and (get settings :copy-kondo-configs? true)
              (not (= :project-namespaces-only (:project-analysis-type @db*)))
              classpath)
-    (when-let [{:keys [config]} (shared/logging-task
-                                  :internal/copy-kondo-configs
-                                  (lsp.kondo/run-kondo-copy-configs! classpath @db*))]
-      (swap! db* shared/assoc-some :kondo-config config))))
+    (let [signature (copied-configs-signature classpath settings @db*)
+          reuse? (= signature (:copied-configs-signature @db*))]
+      (when-let [{:keys [config]} (shared/logging-task
+                                    :internal/copy-kondo-configs
+                                    ;; Resolve the current config in both cases, but don't rescan
+                                    ;; every dependency archive when its exports are unchanged.
+                                    (lsp.kondo/run-kondo-copy-configs! (if reuse? [] classpath) @db*))]
+        (when config
+          (let [signature (if reuse? signature (copied-configs-signature classpath settings @db*))]
+            (swap! db* assoc
+                   :kondo-config config
+                   :kondo-config-hash (:config-hash signature)
+                   :copied-configs-signature signature)))))))
 
 (defn ^:private create-kondo-folder! [^java.io.File clj-kondo-folder]
   (try
@@ -233,9 +285,13 @@
                                                                     :project-hash
                                                                     :settings-hash
                                                                     :kondo-config-hash
+                                                                    :copied-configs-signature
+                                                                    :startup-built-in-lint-cache
                                                                     :dependency-scheme
                                                                     :stubs-generation-namespaces]))
                              state-db (cond-> state-db
+                                        (::db/legacy-cache? (meta db-cache))
+                                        (assoc :cache-needs-migration? true)
                                         (:kondo-findings db-cache)
                                         (assoc-in [:diagnostics :clj-kondo] (:kondo-findings db-cache)))]
                          (if-let [cached-dep-graph (:dep-graph db-cache)]
@@ -273,6 +329,8 @@
         (select-keys [:project-hash
                       :settings-hash
                       :kondo-config-hash
+                      :copied-configs-signature
+                      :startup-built-in-lint-cache
                       :dependency-scheme
                       :project-analysis-type
                       :classpath
@@ -337,7 +395,9 @@
     (ensure-kondo-config-dir-exists! project-root-uri @db*)
     (publish-task-progress producer (:finding-cache task-list) progress-token)
     (load-db-cache! root-path db*)
-    (let [project-hash (classpath/project-specs->hash root-path settings)
+    (let [cached-copied-configs-signature (:copied-configs-signature @db*)
+          cached-built-in-lint (:startup-built-in-lint-cache @db*)
+          project-hash (classpath/project-specs->hash root-path settings)
           settings-hash (config/settings-hash project-settings)
           kondo-config-hash (lsp.kondo/config-hash (str root-path))
           dependency-scheme (:dependency-scheme settings)
@@ -398,8 +458,13 @@
             source-changed? (if (= :project-namespaces-only (:project-analysis-type @db*))
                               (do (analyze-source-paths-namespaces-only! (project-paths-to-analyze @db*) db* progress-fn)
                                   (not use-db-analysis?))
-                              (analyze-source-paths! (project-paths-to-analyze @db*) db* progress-fn (not use-db-analysis?)))]
-        (when (or (not use-db-analysis?) source-changed?)
+                              (analyze-source-paths! (project-paths-to-analyze @db*) db* progress-fn
+                                                     (or (not use-db-analysis?)
+                                                         (not= kondo-config-hash (:kondo-config-hash @db*)))))]
+        (when (or (not use-db-analysis?) source-changed?
+                  (:cache-needs-migration? @db*)
+                  (not= cached-copied-configs-signature (:copied-configs-signature @db*))
+                  (not= cached-built-in-lint (:startup-built-in-lint-cache @db*)))
           (logger/info logger-tag "Caching db for next startup...")
           (upsert-db-cache! @db*)))
       (swap! db* assoc :settings-auto-refresh? true)

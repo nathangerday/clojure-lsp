@@ -1420,21 +1420,27 @@
                                            :range min-range}]
                                          defn-edits)}}))))
 
+(defn ^:private token-named? [zloc node-name]
+  ;; Operator names can only match tokens. Rendering a collection just to
+  ;; compare its text would serialize the entire subtree on every code action.
+  (and (fast= :token (z/tag zloc))
+       (= node-name (z/string zloc))))
+
 (defn ^:private find-nearby-node [zloc node-name]
   ;; Note: can't use z/leftmost here because it spookily
   ;; works at a distance from the user's perspective (like 
   ;; the far end of an expression)
   (cond
     ;; standing on the cond node (co|nd ...
-    (= node-name (z/string zloc))
+    (token-named? zloc node-name)
     (z/skip-whitespace z/up (z/up zloc))
 
     ;; just after the cond node (cond | ...  
-    (= node-name (z/string (z/left zloc)))
+    (token-named? (z/left zloc) node-name)
     (z/skip-whitespace z/up zloc)
 
     ;; just before the cond node (| cond ...
-    (= node-name (z/string (z/right zloc)))
+    (token-named? (z/right zloc) node-name)
     (z/skip-whitespace z/up zloc)
 
     ;; just before the cond expression: |(cond ... or | (cond ...
@@ -1450,17 +1456,17 @@
 (defn near-if?
   "return true if nearby an 'if', otherwise return false"
   [zloc]
-  (= "if" (-> (find-nearby-node zloc "if") z/down z/string)))
+  (token-named? (-> (find-nearby-node zloc "if") z/down) "if"))
 
 (defn near-cond?
   "return true if nearby a 'cond', otherwise return false"
   [zloc]
-  (= "cond" (-> (find-nearby-node zloc "cond") z/down z/string)))
+  (token-named? (-> (find-nearby-node zloc "cond") z/down) "cond"))
 
 (defn ^:private is-if-expr?
   "return false if this is something other than an if (including an else)"
   [loc]
-  (= "if" (z/string (z/down loc))))
+  (token-named? (z/down loc) "if"))
 
 (defn ^:private gather-comments-left [zloc]
   (as-> (z/left* zloc) v
@@ -1582,7 +1588,7 @@
 
 (defn ^:private check-for-cond-errors [cond-expr]
   (cond
-    (not= "cond" (-> cond-expr z/down z/string))
+    (not (token-named? (z/down cond-expr) "cond"))
     {:error {:message "Not a cond"
              :code :invalid-params}}
 

@@ -7,6 +7,7 @@
    [clojure-lsp.feature.diagnostics.built-in :as f.diagnostics.built-in]
    [clojure-lsp.feature.diagnostics.custom :as f.diagnostics.custom]
    [clojure-lsp.kondo :as lsp.kondo]
+   [clojure-lsp.settings :as lsp.settings]
    [clojure-lsp.shared :as shared]
    [clojure-lsp.startup :as startup]
    [clojure.java.io :as io]
@@ -103,6 +104,7 @@
                   lsp.depend/db-with-results (fn [db _] db)
                   f.diagnostics.built-in/db-with-results (fn [db _] db)
                   f.diagnostics.custom/db-with-results (fn [db _] db)
+                  lsp.settings/all (constantly {})
                   shared/filename->uri (fn [f _] (str "file://" f))]
       (testing "warm: re-analyzes only changed/added files and evicts deleted"
         (reset! analyzed nil)
@@ -133,3 +135,122 @@
           (is (= #{a-path b-path} @analyzed))
           (is (= #{} @evicted))
           (is (true? changed?)))))))
+
+(deftest unchanged-startup-reuses-built-in-diagnostics-test
+  (let [dir (fs/create-temp-dir)
+        file (io/file (str dir) "a.clj")
+        path (.getCanonicalPath file)
+        uri (str "file://" path)
+        settings* (atom {:linters {:clojure-lsp/unused-public-var {:level :info}}})
+        built-in-calls* (atom 0)
+        custom-calls* (atom 0)
+        db* (atom {})]
+    (try
+      (spit file "(ns a)")
+      (with-redefs [lsp.settings/all (fn [_] @settings*)
+                    lsp.kondo/run-kondo-on-paths! (fn [& _] {})
+                    lsp.kondo/db-without-uris (fn [db _] db)
+                    lsp.kondo/db-with-results (fn [db _] db)
+                    lsp.depend/analyze-paths! (fn [& _] {})
+                    lsp.depend/db-with-results (fn [db _] db)
+                    f.diagnostics.built-in/analyze-paths! (fn [& _]
+                                                            (swap! built-in-calls* inc)
+                                                            {uri [{:message "Unused public var" :severity 3}]})
+                    f.diagnostics.custom/analyze-paths! (fn [& _]
+                                                          (swap! custom-calls* inc)
+                                                          {})]
+        (let [analyze #(do (#'startup/analyze-source-paths! [(str dir)] db* (fn [_]) %) @db*)]
+          (testing "the first run computes diagnostics; unchanged startup restores the same diagnostics"
+            (let [first-db (analyze false)
+                  warm-db (analyze false)]
+              (is (= 1 @built-in-calls*))
+              (is (= (get-in first-db [:diagnostics :built-in])
+                     (get-in warm-db [:diagnostics :built-in])))
+              (is (= 2 @custom-calls*))))
+          (testing "changing client/project settings recomputes diagnostics"
+            (swap! settings* assoc-in [:linters :clojure-lsp/unused-public-var :level] :off)
+            (analyze false)
+            (is (= 2 @built-in-calls*)))
+          (testing "an incompatible cached linter version recomputes diagnostics"
+            (swap! db* assoc-in [:startup-built-in-lint-cache :version] 0)
+            (analyze false)
+            (is (= 3 @built-in-calls*)))
+          (testing "a changed, added or deleted source file recomputes project diagnostics"
+            (.setLastModified file (+ 3000 (.lastModified file)))
+            (analyze false)
+            (is (= 4 @built-in-calls*))
+            (let [added (io/file (str dir) "b.clj")]
+              (spit added "(ns b)")
+              (analyze false)
+              (is (= 5 @built-in-calls*))
+              (io/delete-file added)
+              (analyze false)
+              (is (= 6 @built-in-calls*))))
+          (testing "invalidated dependency analysis forces a full linter run"
+            (analyze true)
+            (is (= 7 @built-in-calls*)))))
+      (finally (fs/delete-tree dir)))))
+
+(deftest unchanged-startup-reuses-copied-kondo-configs-test
+  (let [dir (fs/create-temp-dir)
+        root (str dir)
+        config-dir (io/file root ".clj-kondo")
+        config-file (io/file config-dir "config.edn")
+        copied-file (io/file config-dir "vendor" "config.edn")
+        jar (io/file root "dependency.jar")
+        source-dir (io/file root "src")
+        exported (io/file source-dir "clj-kondo.exports" "local" "config.edn")
+        classpath [(.getPath jar) (.getPath source-dir)]
+        calls* (atom [])
+        db* (atom {:project-root-uri (str "file://" root)})]
+    (try
+      (io/make-parents config-file)
+      (spit config-file "{}")
+      (spit jar "dependency")
+      (io/make-parents exported)
+      (spit exported "{}")
+      (with-redefs [lsp.kondo/config-hash (fn [_] (slurp config-file))
+                    lsp.kondo/run-kondo-copy-configs! (fn [paths _]
+                                                        (swap! calls* conj paths)
+                                                        (when (seq paths)
+                                                          (io/make-parents copied-file)
+                                                          (spit copied-file "{}"))
+                                                        {:config {:linters {:unused-binding {:level :warning}}}})]
+        (let [copy-configs #(#'startup/copy-configs-from-classpath! classpath {} db*)]
+          (testing "imports once, then resolves current config without rescanning archives"
+            (copy-configs)
+            (copy-configs)
+            (is (= [classpath []] @calls*))
+            (is (= :warning (get-in @db* [:kondo-config :linters :unused-binding :level]))))
+          (testing "clj-kondo's analysis cache does not invalidate copied configs"
+            (let [cache-file (io/file config-dir ".cache" "analysis.json")]
+              (io/make-parents cache-file)
+              (spit cache-file "changed")
+              (copy-configs)
+              (is (= [] (last @calls*)))))
+          (testing "changed dependency archive triggers import again"
+            (.setLastModified jar (+ 3000 (.lastModified jar)))
+            (copy-configs)
+            (is (= classpath (last @calls*))))
+          (testing "new exports in a classpath directory trigger import again"
+            (let [added (io/file (.getParentFile exported) "hook.clj")]
+              (spit added "(ns hook)")
+              (copy-configs)
+              (is (= classpath (last @calls*)))
+              (io/delete-file added)
+              (copy-configs)
+              (is (= classpath (last @calls*)))))
+          (testing "changed local config and removed copied config trigger import again"
+            (spit config-file "{:linters {}}")
+            (copy-configs)
+            (is (= classpath (last @calls*)))
+            (io/delete-file copied-file)
+            (copy-configs)
+            (is (= classpath (last @calls*))))
+          (testing "disabled copying and namespaces-only mode don't import configs"
+            (let [calls @calls*]
+              (#'startup/copy-configs-from-classpath! classpath {:copy-kondo-configs? false} db*)
+              (swap! db* assoc :project-analysis-type :project-namespaces-only)
+              (copy-configs)
+              (is (= calls @calls*))))))
+      (finally (fs/delete-tree dir)))))

@@ -32,9 +32,15 @@
      (io/file cache-dir "lock.mdb")]))
 
 (defn ^:private transit-local-db-file [db]
+  (io/file (config/local-cache-dir db) "db.transit.msgpack"))
+
+(defn ^:private legacy-local-db-file [db]
   (io/file (config/local-cache-dir db) "db.transit.json"))
 
 (defn ^:private transit-global-db-file []
+  (io/file (config/global-cache-dir) "db.transit.msgpack"))
+
+(defn ^:private legacy-global-db-file []
   (io/file (config/global-cache-dir) "db.transit.json"))
 
 (defn ^:private remove-old-sqlite-db-file! [project-root-path]
@@ -48,12 +54,17 @@
        (mapv #(io/delete-file % true))))
 
 (defn db-exists? [db]
-  (shared/file-exists? (transit-local-db-file db)))
+  (or (shared/file-exists? (transit-local-db-file db))
+      (shared/file-exists? (legacy-local-db-file db))))
 
 (defn remove-db! [db]
-  (try
-    (io/delete-file (transit-local-db-file db))
-    (catch IOException _ nil)))
+  (doseq [file [(transit-local-db-file db) (legacy-local-db-file db)]]
+    (try
+      (io/delete-file file)
+      (catch IOException _ nil))))
+
+(defn ^:private cache-format [^java.io.File file]
+  (if (.endsWith (.getName file) ".msgpack") :msgpack :json))
 
 (defn ^:private no-flush-output-stream [^OutputStream os]
   (proxy [java.io.BufferedOutputStream] [os]
@@ -113,14 +124,16 @@
         ;; so a failed or interrupted write never leaves a truncated cache behind.
         ;; https://github.com/cognitect/transit-clj/issues/43
         (with-open [os ^OutputStream (no-flush-output-stream (io/output-stream tmp-file))]
-          (let [writer (transit/writer os :json)
+          (let [writer (transit/writer os (cache-format (io/file cache-file)))
                 cache (cond-> cache
                         (:analysis cache) (update :analysis remove-element-uris))]
             (transit/write writer cache)))
         (atomic-move! tmp-file (io/file cache-file)))
+      true
       (catch Throwable e
         (logger/error db-logger-tag (str "Could not upsert db cache to " cache-file) e)
-        (try (io/delete-file tmp-file true) (catch Exception _))))))
+        (try (io/delete-file tmp-file true) (catch Exception _))
+        nil))))
 
 (defn ^:private read-cache [cache-file]
   (try
@@ -128,7 +141,7 @@
       :db/read-cache
       (if (shared/file-exists? cache-file)
         (let [cache (with-open [is (io/input-stream cache-file)]
-                      (transit/read (transit/reader is :json)))]
+                      (transit/read (transit/reader is (cache-format (io/file cache-file)))))]
           (when (= version (:version cache))
             (cond-> cache
               (:analysis cache) (update :analysis restore-element-uris))))
@@ -142,10 +155,14 @@
     (do
       (remove-old-sqlite-db-file! project-root)
       (remove-old-datalevin-db-file! db)
-      (upsert-cache! project-cache (transit-local-db-file db)))))
+      (when (upsert-cache! project-cache (transit-local-db-file db))
+        (io/delete-file (legacy-local-db-file db) true)))))
 
 (defn read-local-cache [project-root db]
-  (let [project-analysis (read-cache (transit-local-db-file db))]
+  (let [project-analysis (or (when (shared/file-exists? (transit-local-db-file db))
+                               (read-cache (transit-local-db-file db)))
+                             (some-> (read-cache (legacy-local-db-file db))
+                                     (with-meta {::legacy-cache? true})))]
     (when (= (str project-root) (:project-root project-analysis))
       project-analysis)))
 
@@ -156,10 +173,13 @@
       (upsert-local-cache! db)))
 
 (defn ^:private upsert-global-cache! [global-cache]
-  (upsert-cache! global-cache (transit-global-db-file)))
+  (when (upsert-cache! global-cache (transit-global-db-file))
+    (io/delete-file (legacy-global-db-file) true)))
 
 (defn read-global-cache []
-  (let [global-cache (read-cache (transit-global-db-file))]
+  (let [global-cache (or (when (shared/file-exists? (transit-global-db-file))
+                           (read-cache (transit-global-db-file)))
+                         (read-cache (legacy-global-db-file)))]
     (when (= version (:version global-cache))
       global-cache)))
 
