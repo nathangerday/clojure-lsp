@@ -2,8 +2,10 @@
   (:require
    [clojure-lsp.feature.clean-ns :as f.clean-ns]
    [clojure-lsp.feature.file-management :as f.file-management]
+   [clojure-lsp.feature.semantic-tokens :as f.semantic-tokens]
    [clojure-lsp.handlers :as handlers]
    [clojure-lsp.kondo :as lsp.kondo]
+   [clojure-lsp.shared :as shared]
    [clojure-lsp.test-helper.internal :as h]
    [clojure.core.async :as async]
    [clojure.test :refer [deftest is testing]]
@@ -68,6 +70,102 @@
           (finally
             (reset! cancelled? true)
             (future-cancel request)))))))
+
+(defn- request-during-document-change [components request-fn change!]
+  (let [waiting (promise)
+        cancelled? (atom false)
+        components (assoc components :lsp4clj.server/req-cancelled? cancelled?)
+        caught-up? @#'handlers/caught-up?]
+    (with-redefs [handlers/caught-up? (fn [db uri version]
+                                        (let [ready? (caught-up? db uri version)]
+                                          (when-not ready? (deliver waiting true))
+                                          ready?))]
+      (let [request (future (request-fn components))]
+        (try
+          (is (true? (deref waiting 2000 false)) "request captured the pending document session")
+          (is (= ::waiting (deref request 20 ::waiting)))
+          (change!)
+          (deref request 2000 ::timeout)
+          (finally
+            (reset! cancelled? true)
+            (future-cancel request)))))))
+
+(deftest obsolete-document-request-does-not-run-feature
+  (doseq [change [:reopen-pending :reopen-analyzed :reopen-same-version :close :delete]]
+    (testing (name change)
+      (h/reset-components!)
+      (let [uri h/default-uri
+            components (h/components)
+            db* (:db* components)
+            feature-calls (atom 0)]
+        (f.file-management/load-document! uri "{:a 1}" db*)
+        (swap! db* update-in [:documents uri] assoc :v 100 :analyzed-version 99)
+        (with-redefs [shared/file-exists? (constantly true)
+                      f.semantic-tokens/full-tokens (fn [& _] (swap! feature-calls inc) [])]
+          (is (= {:error {:code :content-modified
+                          :message "Document closed or reopened while waiting for analysis."}}
+                 (request-during-document-change
+                   components
+                   #(handlers/semantic-tokens-full % {:text-document {:uri uri}})
+                   #(case change
+                      :close (f.file-management/did-close uri components)
+                      :delete (swap! db* update :documents dissoc uri)
+                      (do
+                        (f.file-management/load-document! uri "{:a 1}" db*)
+                        (case change
+                          :reopen-analyzed (swap! db* assoc-in [:documents uri :analyzed-version] 0)
+                          :reopen-same-version (swap! db* update-in [:documents uri] assoc :v 100 :analyzed-version 100)
+                          nil))))))
+          (is (zero? @feature-calls) "obsolete requests must not use the new session's positions"))))))
+
+(deftest multi-document-request-keeps-ready-session
+  (doseq [change [:close :reopen]]
+    (testing (name change)
+      (h/reset-components!)
+      (let [ready-uri h/default-uri
+            pending-uri (h/file-uri "file:///pending.clj")
+            components (h/components)
+            db* (:db* components)]
+        (f.file-management/load-document! ready-uri "[1]" db*)
+        (swap! db* assoc-in [:documents ready-uri :analyzed-version] 0)
+        (f.file-management/load-document! pending-uri "[2]" db*)
+        (with-redefs [shared/file-exists? (constantly true)]
+          (is (= :content-modified
+                 (:delay/outcome
+                  (request-during-document-change
+                    components
+                    #(#'handlers/wait-for-changes % [ready-uri pending-uri])
+                    #(case change
+                       :close (f.file-management/did-close ready-uri components)
+                       :reopen (f.file-management/load-document! ready-uri "[3]" db*)))))))))))
+
+(deftest reopened-document-request-waits-for-current-analysis
+  (let [uri h/default-uri
+        components (h/components)
+        db* (:db* components)
+        text "{:a 1}"]
+    (f.file-management/load-document! uri text db*)
+    (swap! db* update-in [:documents uri] assoc :v 100 :analyzed-version 99)
+    (f.file-management/load-document! uri text db*)
+    (is (= {:data [0 2 1 4 0]}
+           (request-during-document-change
+             components
+             #(handlers/semantic-tokens-full % {:text-document {:uri uri}})
+             #(f.file-management/analyze-changes
+                {:uri uri :text text :version 0
+                 :open-session (get-in @db* [:documents uri :open-session])}
+                components))))))
+
+(deftest closed-document-uses-cached-analysis
+  (let [uri h/default-uri
+        components (h/components)]
+    (h/load-code-and-locs "{:a 1}" uri)
+    (swap! (h/db*) assoc-in [:documents uri :v] 100)
+    (with-redefs [shared/file-exists? (constantly true)]
+      (f.file-management/did-close uri components))
+    (is (= :immediate (:delay/outcome (#'handlers/wait-for-changes components [uri]))))
+    (is (= {:data [0 2 1 4 0]}
+           (handlers/semantic-tokens-full components {:text-document {:uri uri}})))))
 
 (defn- run-clean-ns-and-check-result
   ([input-code expected-code]

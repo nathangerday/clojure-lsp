@@ -102,9 +102,10 @@
 
 (deftest opening-resets-analysis-version
   (let [uri h/default-uri]
-    (swap! (h/db*) assoc-in [:documents uri :analyzed-version] 42)
+    (swap! (h/db*) assoc-in [:documents uri] {:analyzed-version 42 :closed? true})
     (f.file-management/load-document! uri "{:a 1}" (h/db*))
     (is (= -1 (get-in (h/db) [:documents uri :analyzed-version])))
+    (is (false? (get-in (h/db) [:documents uri :closed?])))
     (h/load-code-and-locs "{:a 1}" uri)
     (is (= 0 (get-in (h/db) [:documents uri :v])))
     (is (= 0 (get-in (h/db) [:documents uri :analyzed-version])))))
@@ -148,6 +149,7 @@
       (is (get-in (h/db) [:diagnostics :clj-kondo uri]))
       (is (seq (get-in (h/db) [:dep-graph 'foo :uris])))
       (is (get-in (h/db) [:documents uri]))
+      (is (true? (get-in (h/db) [:documents uri :closed?])))
       (h/assert-no-take mock-diagnostics-chan 500)))
   (testing "when local file not exists on disk"
     (let [mock-diagnostics-chan (h/make-diagnostics-channel)
@@ -172,6 +174,7 @@
       (is (get-in (h/db) [:diagnostics :clj-kondo uri]))
       (is (seq (get-in (h/db) [:dep-graph 'some-jar :uris])))
       (is (get-in (h/db) [:documents uri]))
+      (is (true? (get-in (h/db) [:documents uri :closed?])))
       (is (= {:uri uri
               :diagnostics []}
              (h/take-or-timeout mock-diagnostics-chan 500))))))
