@@ -270,10 +270,11 @@
   (and (identical? (:analysis a) (:analysis b))
        (= (dissoc a :analysis) (dissoc b :analysis))))
 
-(defn analyze-changes [{:keys [uri text version]} {:keys [producer db*] :as components}]
+(defn analyze-changes [{:keys [uri text version open-session]} {:keys [producer db*] :as components}]
   (loop [state-db @db* previous-inputs nil previous-results nil]
     (let [document (get-in state-db [:documents uri])]
-      (when (and (>= version (get document :v -1))
+      (when (and (= version (:v document))
+                 (= open-session (:open-session document))
                  (or (nil? (:text document)) (= text (:text document))))
         (let [inputs (analysis-inputs state-db)
               reusable? (and previous-results (same-analysis-inputs? inputs previous-inputs))
@@ -308,14 +309,16 @@
             (recur @db* inputs {:kondo kondo-result :depend depend-result})))))))
 
 (defn did-change [uri changes version {:keys [db* current-changes-chan]}]
-  (let [old-text (get-in @db* [:documents uri :text])
-        final-text (reduce handle-change old-text changes)]
-    (swap! db* (fn [state-db] (-> state-db
-                                  (assoc-in [:documents uri :v] version)
-                                  (assoc-in [:documents uri :text] final-text))))
+  (let [state-db (swap! db* (fn [state-db]
+                              (let [text (reduce handle-change (get-in state-db [:documents uri :text]) changes)]
+                                (-> state-db
+                                    (assoc-in [:documents uri :v] version)
+                                    (assoc-in [:documents uri :text] text)))))
+        document (get-in state-db [:documents uri])]
     (async/>!! current-changes-chan {:uri uri
-                                     :text final-text
-                                     :version version})))
+                                     :text (:text document)
+                                     :version version
+                                     :open-session (:open-session document)})))
 
 (defn analyze-watched-files! [uris {:keys [db* producer] :as components}]
   (let [old-db @db*
