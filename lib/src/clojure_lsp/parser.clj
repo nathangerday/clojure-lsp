@@ -6,7 +6,9 @@
    [clojure.string :as string]
    [rewrite-clj.node :as n]
    [rewrite-clj.parser :as p]
-   [rewrite-clj.zip :as z]))
+   [rewrite-clj.zip :as z])
+  (:import
+   [java.util UUID]))
 
 (set! *warn-on-reflection* true)
 
@@ -109,11 +111,26 @@
 (def ^:private max-cached-documents 32)
 (def ^:private max-cached-characters 2000000)
 (defonce ^:private roots* (atom {}))
+(defonce ^:private document-sessions* (atom {}))
 
 (defn clear-document-cache!
   "Release a document's parse tree on close/reopen, or all trees on shutdown."
-  ([] (reset! roots* {}))
-  ([uri] (swap! roots* dissoc uri)))
+  ([] (locking roots*
+        (reset! roots* {})
+        (reset! document-sessions* {})))
+  ([uri] (locking roots*
+           (swap! roots* dissoc uri)
+           (swap! document-sessions* dissoc uri))))
+
+(defn start-document-cache!
+  "Begin a new open-document session. Requests holding older DB snapshots can
+  still parse their text, but cannot populate this session's cache."
+  [uri]
+  (let [session (UUID/randomUUID)]
+    (locking roots*
+      (swap! roots* dissoc uri)
+      (swap! document-sessions* assoc uri session))
+    session))
 
 (defn- bounded-roots [roots]
   (loop [roots roots]
@@ -122,7 +139,7 @@
       (recur (dissoc roots (key (apply min-key (comp :access val) roots))))
       roots)))
 
-(defn- cached-root [uri text version]
+(defn- cached-root [uri text version session]
   (let [root (locking roots*
                (let [previous (get @roots* uri)
                      root (if (= text (:text previous))
@@ -130,7 +147,8 @@
                             (delay (zloc-of-string text)))]
                  ;; An older snapshot remains valid for its own request, but
                  ;; must not replace the tree already cached for a newer edit.
-                 (when (and (<= (count text) max-cached-characters)
+                 (when (and (= session (get @document-sessions* uri))
+                            (<= (count text) max-cached-characters)
                             (or (nil? version) (nil? (:version previous))
                                 (>= version (:version previous))))
                    (swap! roots* #(bounded-roots (assoc % uri {:text text :version version
@@ -145,7 +163,8 @@
 
 (defn zloc-of-file [db uri]
   (if-some [text (get-in db [:documents uri :text])]
-    (cached-root uri text (get-in db [:documents uri :v]))
+    (cached-root uri text (get-in db [:documents uri :v])
+                 (get-in db [:documents uri :open-session]))
     ;; Disk-backed documents can change outside didChange; never reuse their
     ;; trees without reading the current file.
     (zloc-of-string (shared/slurp-uri uri))))

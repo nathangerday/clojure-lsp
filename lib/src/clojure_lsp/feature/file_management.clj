@@ -33,10 +33,11 @@
         (shared/client-changes changes db)))))
 
 (defn load-document! [uri text db*]
-  (parser/clear-document-cache! uri)
   ;; Reset both versions when reopening too: cached analysis belongs to the
   ;; previous document session. A negative marker makes requests wait for open.
-  (swap! db* update-in [:documents uri] assoc :v 0 :analyzed-version -1 :text text :saved-on-disk false))
+  (let [session (parser/start-document-cache! uri)]
+    (swap! db* update-in [:documents uri] assoc :v 0 :analyzed-version -1
+           :text text :saved-on-disk false :open-session session)))
 
 (defn did-open [uri text {:keys [db* producer edits-chan] :as components} allow-create-ns]
   (load-document! uri text db*)
