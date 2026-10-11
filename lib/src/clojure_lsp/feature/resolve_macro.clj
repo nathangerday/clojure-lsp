@@ -96,6 +96,7 @@
               (spit kondo-config-path new-kondo-config)
               (f.file-management/analyze-changes {:uri uri
                                                   :version (:v document)
+                                                  :open-session (:open-session document)
                                                   :text (:text document)}
                                                  components)
               (logger/info logger-tag (format "Resolving macro as %s. Saving setting into %s" resolved-full-symbol-str kondo-config-path)))

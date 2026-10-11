@@ -6,6 +6,7 @@
    [clojure-lsp.feature.diagnostics.built-in :as built-in]
    [clojure-lsp.feature.diagnostics.custom :as custom]
    [clojure-lsp.feature.file-management :as f.file-management]
+   [clojure-lsp.handlers :as handlers]
    [clojure-lsp.kondo :as kondo]
    [clojure-lsp.shared :as shared]
    [clojure-lsp.test-helper.internal :as h]
@@ -14,6 +15,36 @@
    [medley.core :as medley]))
 
 (h/reset-components-before-test)
+
+(deftest analysis-retry-rejects-previous-document-sessions
+  (doseq [[old-version new-version] [[100 0] [7 7]]]
+    (h/reset-components!)
+    (let [uri h/default-uri
+          db* (h/db*)
+          text "[1]"
+          old-session (get-in (f.file-management/load-document! uri text db*)
+                              [:documents uri :open-session])
+          publications* (atom 0)]
+      (swap! db* assoc-in [:documents uri :v] old-version)
+      (with-redefs [kondo/run-kondo-on-text! (fn [_ _ _]
+                                               ;; Reopen with identical text while old analysis is running.
+                                               (f.file-management/load-document! uri text db*)
+                                               (swap! db* assoc-in [:documents uri :v] new-version)
+                                               {:analysis {uri {:var-definitions [{:name 'stale}]}}
+                                                :findings {uri []}})
+                    depend/analyze-uri! (fn [_ _] nil)
+                    built-in/analyze-uri! (fn [_ _] {})
+                    custom/analyze-uri! (fn [_ _] {})
+                    diagnostics/publish-diagnostics! (fn [_ _] (swap! publications* inc))
+                    f.file-management/notify-references (fn [& _])]
+        (f.file-management/analyze-changes {:uri uri :text text :version old-version :open-session old-session}
+                                           (h/components)))
+      (is (not= old-session (get-in @db* [:documents uri :open-session])))
+      (is (= new-version (get-in @db* [:documents uri :v])))
+      (is (= -1 (get-in @db* [:documents uri :analyzed-version])))
+      (is (empty? (get-in @db* [:analysis uri :var-definitions])))
+      (is (zero? @publications*))
+      (is (false? (#'handlers/caught-up? @db* uri (inc new-version)))))))
 
 (deftest analysis-retry-reuses-only-unchanged-inputs
   (doseq [[label update-db expected-runs]
@@ -189,7 +220,8 @@
                                          :current-changes-chan mock-changes-chan))
     (is (= 2 (get-in (h/db) [:documents h/default-uri :v])))
     (is (= edited-text (get-in (h/db) [:documents h/default-uri :text])))
-    (is (= {:uri h/default-uri, :text edited-text, :version 2}
+    (is (= {:uri h/default-uri, :text edited-text, :version 2
+            :open-session (get-in (h/db) [:documents h/default-uri :open-session])}
            (h/take-or-timeout mock-changes-chan 500)))))
 
 (deftest did-change-watched-files
