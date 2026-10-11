@@ -53,50 +53,65 @@
   #_{})
 
 (defn ^:private caught-up? [db uri desired-version]
-  (let [analysed-version (get-in db [:documents uri :analyzed-version])]
+  (let [document (get-in db [:documents uri])
+        analysed-version (:analyzed-version document)]
     (or
       ;; The doc was never opened, or was closed. Whatever analysis we have has to be good enough.
+      (:closed? document)
       (not analysed-version)
       ;; The analysis has caught up.
       (>= analysed-version desired-version))))
 
+(defn- document-session [db uri]
+  (let [document (get-in db [:documents uri])]
+    [(:open-session document) (boolean (:closed? document))]))
+
 (defn ^:private wait-for-changes [{:keys [db* :lsp4clj.server/req-cancelled?]} uris]
   (let [delay-start (System/nanoTime)
-        db @db*]
+        db @db*
+        ;; Capture eagerly and retain every session, even after its analysis is ready.
+        desired-documents (mapv (fn [uri]
+                                  [uri (get-in db [:documents uri :v] 0)
+                                   (document-session db uri)])
+                                uris)]
     (loop [immediate? true
            backoff backoff-start
-           ;; At the time of the request, what was the client looking at?
-           desired-versions (map (fn [uri]
-                                   [uri (get-in db [:documents uri :v] 0)])
-                                 uris)]
-      (let [now (System/nanoTime)]
+           processing-documents desired-documents]
+      (let [now (System/nanoTime)
+            db @db*]
         (cond
           (some-> req-cancelled? deref)
           {:delay/outcome :cancelled
            :delay/start delay-start
            :delay/end now}
+          (some (fn [[uri _ session]]
+                  (not= session (document-session db uri)))
+                desired-documents)
+          {:delay/outcome :content-modified
+           :delay/start delay-start
+           :delay/end now}
           (> (quot (- now delay-start) 1000000) 60000) ; one minute timeout
           {:delay/outcome :timed-out
-           :delay/timeout-uris (map first desired-versions)}
+           :delay/timeout-uris (map first processing-documents)}
           :else
           ;; At the current time, do we have analysis for what the client was looking at?
-          (let [db @db*]
-            (if-let [processing-versions (->> desired-versions
-                                              (remove (fn [[uri desired-version]]
-                                                        (caught-up? db uri desired-version)))
-                                              seq)]
-              (do
-                (Thread/sleep (long backoff))
-                (recur false (min backoff-max (* backoff-mult backoff)) processing-versions))
-              (if immediate?
-                {:delay/outcome :immediate
-                 :delay/start delay-start}
-                {:delay/outcome :waited
-                 :delay/start delay-start
-                 :delay/end now}))))))))
+          (if-let [pending-documents (->> processing-documents
+                                          (remove (fn [[uri desired-version]]
+                                                    (caught-up? db uri desired-version)))
+                                          seq)]
+            (do
+              (Thread/sleep (long backoff))
+              (recur false (min backoff-max (* backoff-mult backoff)) pending-documents))
+            (if immediate?
+              {:delay/outcome :immediate
+               :delay/start delay-start}
+              {:delay/outcome :waited
+               :delay/start delay-start
+               :delay/end now})))))))
 
 (defmacro logging-delayed-task [delay-data task-id & body]
   (let [cancelled-msg (str ":internal/cancelled-request in " task-id " - waited %s")
+        modified-msg (str ":internal/obsolete-request in " task-id " - waited %s")
         timed-out-msg (format ":internal/timeout-request in %s waiting for changes to %%s" task-id)
         immediate-msg (str task-id " %s")
         waited-msg (str immediate-msg " - waited %s")
@@ -109,6 +124,11 @@
            ~(with-meta `(logger/debug ~msg-sym) (meta &form))
            {:error {:code :request-cancelled
                     :message "Request cancelled by client."}})
+         :content-modified
+         (let [~msg-sym (format ~modified-msg (shared/format-time-delta-ms (:delay/start delay-data#) (:delay/end delay-data#)))]
+           ~(with-meta `(logger/debug ~msg-sym) (meta &form))
+           {:error {:code :content-modified
+                    :message "Document closed or reopened while waiting for analysis."}})
          :timed-out
          (let [~msg-sym (format ~timed-out-msg (first (:delay/timeout-uris delay-data#)))]
            ~(with-meta `(logger/warn ~msg-sym) (meta &form))

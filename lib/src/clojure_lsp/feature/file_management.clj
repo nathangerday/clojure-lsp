@@ -37,7 +37,7 @@
   ;; previous document session. A negative marker makes requests wait for open.
   (let [session (parser/start-document-cache! uri)]
     (swap! db* update-in [:documents uri] assoc :v 0 :analyzed-version -1
-           :text text :saved-on-disk false :open-session session)))
+           :text text :saved-on-disk false :open-session session :closed? false)))
 
 (defn did-open [uri text {:keys [db* producer edits-chan] :as components} allow-create-ns]
   (load-document! uri text db*)
@@ -384,6 +384,12 @@
         (files-deleted db components deleted)))))
 
 (defn did-close [uri {:keys [db*] :as components}]
+  ;; Keep cached text/analysis and the retired session's parse-cache protection,
+  ;; but let pending requests distinguish closing from ordinary version updates.
+  (swap! db* (fn [db]
+               (if (get-in db [:documents uri])
+                 (assoc-in db [:documents uri :closed?] true)
+                 db)))
   (parser/clear-document-cache! uri)
   (let [db @db*
         filename (shared/uri->filename uri)
