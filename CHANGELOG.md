@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Batch reference diagnostics after external file changes and avoid repeating expensive linters on unrelated database updates. Preserve current editor sessions and diagnostics during concurrent edits, deletions and renames.
+
 - Bump clj-kondo to `2026.10.27-20261026.141932-1`.
 - Fix completion for auto-resolved keywords: `::foo`. #2488
 - Add `backward-sexp-or-up` and `forward-sexp-or-up` Paredit commands.

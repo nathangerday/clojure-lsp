@@ -8,11 +8,14 @@
    [clojure-lsp.feature.file-management :as f.file-management]
    [clojure-lsp.handlers :as handlers]
    [clojure-lsp.kondo :as kondo]
+   [clojure-lsp.parser :as parser]
+   [clojure-lsp.producer :as producer]
    [clojure-lsp.shared :as shared]
    [clojure-lsp.test-helper.internal :as h]
    [clojure.core.async :as async]
    [clojure.test :refer [are deftest is testing]]
-   [medley.core :as medley]))
+   [medley.core :as medley]
+   [rewrite-clj.zip :as z]))
 
 (h/reset-components-before-test)
 
@@ -75,10 +78,11 @@
           (f.file-management/analyze-changes {:uri uri :text "[1]" :version 1} (h/components)))
         (is (= expected-runs @runs*))
         (is (= expected-runs @depend-runs*))
-        (is (= 2 (count @diagnostics-states*)))
+        (is (= (if (= label "unrelated bookkeeping") 1 2)
+               (count @diagnostics-states*)))
         (is (= 1 (get-in @db* [:documents uri :analyzed-version])))
         (when (= label "unrelated bookkeeping")
-          (is (= [nil :updated] @diagnostics-states*))
+          (is (= [nil] @diagnostics-states*))
           (is (= :updated (:progress @db*))))))))
 
 (deftest analysis-retry-abandons-stale-text
@@ -236,7 +240,7 @@
           :uri h/default-uri}]
         (assoc (h/components)
                :watched-files-chan mock-watched-files-chan))
-      (is (= {:uri h/default-uri :type :created} (h/take-or-timeout mock-watched-files-chan 1000)))))
+      (is (= {:uri h/default-uri :type :created :document-state {}} (h/take-or-timeout mock-watched-files-chan 1000)))))
   (testing "changed file"
     (let [mock-watched-files-chan (async/chan 1)]
       (f.file-management/did-change-watched-files
@@ -244,15 +248,14 @@
           :uri h/default-uri}]
         (assoc (h/components)
                :watched-files-chan mock-watched-files-chan))
-      (is (= {:uri h/default-uri :type :changed} (h/take-or-timeout mock-watched-files-chan 1000)))))
-  (testing "deleted file"
+      (is (= {:uri h/default-uri :type :changed :document-state {}} (h/take-or-timeout mock-watched-files-chan 1000)))))
+  (testing "deleted file is queued with other events"
     (let [mock-watched-files-chan (async/chan 1)]
       (f.file-management/did-change-watched-files
-        [{:type :deleted
-          :uri h/default-uri}]
-        (assoc (h/components)
-               :watched-files-chan mock-watched-files-chan))
-      (is (= {:uri h/default-uri :type :deleted} (h/take-or-timeout mock-watched-files-chan 1000)))))
+        [{:type :deleted :uri h/default-uri}]
+        (assoc (h/components) :watched-files-chan mock-watched-files-chan))
+      (is (= {:uri h/default-uri :type :deleted :document-state {}}
+             (h/take-or-timeout mock-watched-files-chan 500)))))
   (testing "watched files ignored by source-path-ignore-regex"
     (swap! (h/db*) medley/deep-merge {:settings {:source-paths #{(h/file-path "/target")
                                                                  (h/file-path "/src")}}
@@ -265,7 +268,7 @@
           :uri (h/file-uri "file:///project/src/a.clj")}]
         (assoc (h/components)
                :watched-files-chan mock-watched-files-chan))
-      (is (= {:uri (h/file-uri "file:///project/src/a.clj") :type :changed}
+      (is (= {:uri (h/file-uri "file:///project/src/a.clj") :type :changed :document-state {}}
              (h/take-or-timeout mock-watched-files-chan 1000)))
       (h/assert-no-take mock-watched-files-chan 500))))
 
@@ -592,3 +595,351 @@
               "a/bar is known with its unsaved arity, so it's not reported as unresolved")))
       (finally
         (fs/delete-tree project-dir)))))
+
+(deftest reference-analysis-reuses-only-valid-snapshots
+  (doseq [[label update-db expected-runs]
+          [["bookkeeping" #(assoc % :progress :updated) 1]
+           ["project usages" #(assoc-in % [:analysis "other" :keyword-usages] [{:name 'used}]) 2]
+           ["dependency graph" #(assoc-in % [:dep-graph 'other :internal?] true) 2]
+           ["ignore comments" #(assoc-in % [:documents "other" :text] "#_:clojure-lsp/ignore (def x 1)") 2]
+           ["settings" #(assoc-in % [:settings :linters :clojure-lsp/unused-public-var :level] :off) 2]]]
+    (testing label
+      (h/reset-components!)
+      (let [uri h/default-uri
+            db* (h/db*)
+            kondo-runs* (atom 0)
+            linter-runs* (atom 0)]
+        (swap! db* assoc :analysis {uri {}})
+        (with-redefs [shared/file-exists? (constantly true)
+                      kondo/run-kondo-on-reference-uris!
+                      (fn [uris _]
+                        (swap! kondo-runs* inc)
+                        {:analysis (zipmap uris (repeat {})) :findings (zipmap uris (repeat []))})
+                      built-in/analyze-uri!
+                      (fn [uri state]
+                        (when (= 1 (swap! linter-runs* inc))
+                          (swap! db* update-db))
+                        {uri [{:message (if (:progress state) "updated" "snapshot")}]})]
+          (f.file-management/analyze-reference-uris! [uri] db*))
+        (is (= expected-runs @kondo-runs*))
+        (is (= expected-runs @linter-runs*))
+        (is (seq (get-in @db* [:diagnostics :built-in uri])))
+        (when (= label "bookkeeping")
+          (is (= :updated (:progress @db*))))))))
+
+(deftest reference-analysis-preserves-new-editor-sessions
+  (doseq [change [:edit :reopen :delete]]
+    (testing (name change)
+      (h/reset-components!)
+      (let [uri h/default-uri
+            db* (h/db*)
+            runs* (atom [])
+            session (get-in (f.file-management/load-document! uri "old" db*)
+                            [:documents uri :open-session])]
+        (swap! db* assoc :analysis {uri {}})
+        (with-redefs [kondo/run-kondo-on-text!
+                      (fn [text uri _]
+                        (swap! runs* conj text)
+                        (when (= 1 (count @runs*))
+                          (case change
+                            :edit (swap! db* update-in [:documents uri] assoc :text "new" :v 1)
+                            :reopen (f.file-management/load-document! uri "new" db*)
+                            :delete (swap! db* kondo/db-without-uris [uri])))
+                        {:analysis {uri {:text text}} :findings {uri []}})
+                      built-in/analyze-uri! (fn [uri state] {uri [{:message (get-in state [:analysis uri :text])}]})]
+          (f.file-management/analyze-reference-uris! [uri] db*))
+        (if (= :delete change)
+          (do (is (= ["old"] @runs*))
+              (is (nil? (get-in @db* [:analysis uri])))
+              (is (nil? (get-in @db* [:diagnostics :built-in uri]))))
+          (do (is (= ["old" "new"] @runs*))
+              (is (= "new" (get-in @db* [:analysis uri :text])))
+              (is (= [{:message "new"}] (get-in @db* [:diagnostics :built-in uri])))
+              (when (= :reopen change)
+                (is (not= session (get-in @db* [:documents uri :open-session])))
+                (is (zero? (get-in @db* [:documents uri :v]))))))))))
+
+(deftest bulk-watched-files-share-one-reference-analysis
+  (let [sources (mapv #(h/file-uri (str "file:///src/source" % ".clj")) (range 200))
+        target (h/file-uri "file:///src/target.clj")
+        db* (h/db*)
+        reference-batches* (atom [])
+        active* (atom 0)
+        max-active* (atom 0)]
+    (swap! db* assoc :analysis (zipmap (conj sources target) (repeat {})))
+    (with-redefs [shared/file-exists? (constantly true)
+                  f.file-management/reference-uris (fn [_ _ _] #{target})
+                  kondo/run-kondo-on-reference-uris!
+                  (fn [uris _]
+                    (let [active (swap! active* inc)]
+                      (swap! max-active* max active)
+                      (when (= [target] (vec uris))
+                        (swap! reference-batches* conj (set uris)))
+                      (swap! active* dec)
+                      {:analysis (zipmap uris (repeat {})) :findings (zipmap uris (repeat []))}))
+                  built-in/analyze-uri! (fn [uri _] {uri []})
+                  built-in/analyze-uris! (fn [uris _] (zipmap uris (repeat [])))
+                  diagnostics/publish-all-diagnostics! (fn [& _])
+                  producer/refresh-code-lens (fn [& _])]
+      (f.file-management/analyze-watched-files! (mapv #(hash-map :uri % :type :changed) sources)
+                                                (h/components)))
+    ;; Completion is synchronous, so there are no outstanding jobs to await.
+    (is (= [#{target}] @reference-batches*))
+    (is (= 1 @max-active*))
+    (is (zero? @active*))))
+
+(deftest watched-files-use-the-final-event
+  (let [deleted (h/file-uri "file:///src/deleted.clj")
+        recreated (h/file-uri "file:///src/recreated.clj")
+        db* (h/db*)
+        batches* (atom [])]
+    (swap! db* assoc :analysis {deleted {} recreated {}}
+           :settings {:notify-references-on-file-change false})
+    (with-redefs [shared/file-exists? (constantly true)
+                  kondo/run-kondo-on-reference-uris!
+                  (fn [uris _]
+                    (swap! batches* conj (set uris))
+                    {:analysis (zipmap uris (repeat {:fresh true})) :findings (zipmap uris (repeat []))})
+                  built-in/analyze-uri! (fn [uri _] {uri []})
+                  diagnostics/publish-all-diagnostics! (fn [& _])
+                  diagnostics/publish-empty-diagnostics! (fn [& _])]
+      (f.file-management/analyze-watched-files!
+        [{:uri deleted :type :created} {:uri recreated :type :deleted}
+         {:uri deleted :type :deleted} {:uri recreated :type :created}
+         {:uri recreated :type :changed}]
+        (h/components)))
+    (is (= [#{recreated}] @batches*))
+    (is (nil? (get-in @db* [:analysis deleted])))
+    (is (= {:fresh true} (get-in @db* [:analysis recreated])))))
+
+(deftest deleted-namespaces-still-notify-surviving-dependents
+  (let [deleted (h/file-uri "file:///src/a.clj")
+        dependent (h/file-uri "file:///src/b.clj")
+        db* (h/db*)
+        batches* (atom [])]
+    (h/load-code-and-locs "(ns a) (def foo 1)" deleted)
+    (h/load-code-and-locs "(ns b (:require [a :as a])) (a/foo)" dependent)
+    (with-redefs [kondo/run-kondo-on-text!
+                  (fn [_ uri _]
+                    (swap! batches* conj uri)
+                    {:analysis {uri (get-in @db* [:analysis uri])} :findings {uri []}})
+                  built-in/analyze-uri! (fn [uri _] {uri []})
+                  diagnostics/publish-all-diagnostics! (fn [& _])
+                  diagnostics/publish-empty-diagnostics! (fn [& _])
+                  producer/refresh-code-lens (fn [& _])]
+      (f.file-management/analyze-watched-files! [{:uri deleted :type :deleted}] (h/components)))
+    (is (= [dependent] @batches*))
+    (is (nil? (get-in @db* [:analysis deleted])))))
+
+(deftest reference-gate-recovers-after-failure
+  (let [uri h/default-uri
+        db* (h/db*)]
+    (swap! db* assoc :analysis {uri {}})
+    (with-redefs [shared/file-exists? (constantly true)
+                  kondo/run-kondo-on-reference-uris! (fn [& _] (throw (ex-info "failed analysis" {})))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"failed analysis"
+                            (f.file-management/analyze-reference-uris! [uri] db*))))
+    (with-redefs [shared/file-exists? (constantly true)
+                  kondo/run-kondo-on-reference-uris! (fn [& _] {:analysis {uri {}} :findings {uri []}})
+                  built-in/analyze-uri! (fn [uri _] {uri []})]
+      (is (= [uri] (:uris (f.file-management/analyze-reference-uris! [uri] db*)))))))
+
+(deftest reference-analysis-rejects-stale-unused-diagnostics
+  (let [source (h/file-uri "file:///src/a.clj")
+        consumer (h/file-uri "file:///src/b.clj")
+        db* (h/db*)
+        original-analyze built-in/analyze-uri!
+        runs* (atom 0)]
+    (h/load-code-and-locs "(ns a) (def foo 1)" source)
+    (h/load-code-and-locs "(ns b (:require [a]))" consumer)
+    (let [new-usage (kondo/run-kondo-on-text! "(ns b (:require [a])) a/foo" consumer (atom @db*))]
+      (with-redefs [built-in/analyze-uri!
+                    (fn [uri state]
+                      (let [diags (original-analyze uri state)]
+                        (when (= 1 (swap! runs* inc))
+                          (is (some #(= "clojure-lsp/unused-public-var" (:code %)) (get diags source)))
+                          (swap! db* kondo/db-with-results new-usage))
+                        diags))]
+        (f.file-management/analyze-reference-uris! [source] db*)))
+    (is (= 2 @runs*))
+    (is (empty? (get-in @db* [:diagnostics :built-in source])))))
+
+(deftest reference-analysis-is-serialized-before-starting-work
+  (let [uri h/default-uri
+        db* (h/db*)
+        entered (promise)
+        release (promise)
+        attempted (promise)
+        calls* (atom 0)
+        errors* (atom [])
+        run #(try (f.file-management/analyze-reference-uris! [uri] db*)
+                  (catch Throwable e (swap! errors* conj e)))
+        first-worker (Thread. ^Runnable run)
+        second-worker (Thread. ^Runnable #(do (deliver attempted true) (run)))]
+    (swap! db* assoc :analysis {uri {}})
+    (with-redefs [shared/file-exists? (constantly true)
+                  kondo/run-kondo-on-reference-uris!
+                  (fn [& _]
+                    (when (= 1 (swap! calls* inc))
+                      (deliver entered true)
+                      (deref release 5000 nil))
+                    {:analysis {uri {}} :findings {uri []}})
+                  built-in/analyze-uri! (fn [uri _] {uri []})]
+      (try
+        (.start first-worker)
+        (is (= true (deref entered 5000 :timeout)))
+        (.start second-worker)
+        (is (= true (deref attempted 5000 :timeout)))
+        (let [deadline (+ (System/nanoTime) 2000000000)]
+          (loop []
+            (when (and (.isAlive second-worker)
+                       (not= Thread$State/BLOCKED (.getState second-worker))
+                       (< (System/nanoTime) deadline))
+              (Thread/sleep 1)
+              (recur))))
+        (is (= Thread$State/BLOCKED (.getState second-worker)))
+        (is (= 1 @calls*))
+        (finally
+          (deliver release true)
+          (.join first-worker 5000)
+          (.join second-worker 5000))))
+    (is (empty? @errors*))
+    (is (= 2 @calls*))
+    (is (not (.isAlive first-worker)))
+    (is (not (.isAlive second-worker)))))
+
+(deftest watched-file-diagnostics-follow-disk-changes
+  (let [root (fs/create-temp-dir {:prefix "clojure-lsp-watched-"})
+        db* (h/db*)
+        a-path (str (fs/path root "a.clj"))
+        b-path (str (fs/path root "b.clj"))
+        a (shared/filename->uri a-path @db*)
+        b (shared/filename->uri b-path @db*)
+        analyze #(f.file-management/analyze-watched-files! % (h/components))]
+    (try
+      (swap! db* assoc :project-root-uri (shared/filename->uri (str root) @db*)
+             :settings {:source-paths #{(str root)}})
+      (spit a-path "(ns a) (def foo 1)")
+      (spit b-path "(ns b (:require [a])) a/foo")
+      (analyze [{:uri a :type :created} {:uri b :type :created}])
+      (is (empty? (get-in @db* [:diagnostics :built-in a])))
+      (is (not-any? #(= :unresolved-var (:type %)) (get-in @db* [:diagnostics :clj-kondo b])))
+      (spit b-path "(ns b (:require [a]))")
+      (analyze [{:uri b :type :changed}])
+      (is (some #(= "clojure-lsp/unused-public-var" (:code %))
+                (get-in @db* [:diagnostics :built-in a])))
+      (spit b-path "(ns b (:require [a])) a/foo")
+      (analyze [{:uri b :type :changed}])
+      (is (empty? (get-in @db* [:diagnostics :built-in a])))
+      (spit a-path "(ns a) (def bar 2)")
+      (analyze [{:uri a :type :changed}])
+      (is (some #(= :unresolved-var (:type %)) (get-in @db* [:diagnostics :clj-kondo b])))
+      (spit a-path "(ns a) (def foo 2)")
+      (analyze [{:uri a :type :deleted} {:uri a :type :created}])
+      (is (not-any? #(= :unresolved-var (:type %)) (get-in @db* [:diagnostics :clj-kondo b])))
+      (let [c-path (str (fs/path root "c.clj"))
+            c (shared/filename->uri c-path @db*)]
+        (fs/move a-path c-path)
+        (spit c-path "(ns c) (def foo 2)")
+        (spit b-path "(ns b (:require [c])) c/foo")
+        (analyze [{:uri a :type :deleted} {:uri c :type :created} {:uri b :type :changed}])
+        (is (nil? (get-in @db* [:analysis a])))
+        (is (= 'c (get-in @db* [:analysis c :namespace-definitions 0 :name])))
+        (is (empty? (get-in @db* [:diagnostics :built-in c])))
+        (is (not-any? #(contains? #{:unresolved-var :unresolved-namespace} (:type %))
+                      (get-in @db* [:diagnostics :clj-kondo b])))
+        (fs/delete c-path)
+        (analyze [{:uri c :type :deleted}])
+        (is (nil? (get-in @db* [:analysis c])))
+        (is (nil? (get-in @db* [:diagnostics :built-in c]))))
+      (finally (fs/delete-tree root)))))
+
+(deftest queued-deletion-preserves-a-new-editor-session
+  (let [uri h/default-uri
+        db* (h/db*)
+        watched (async/chan 2)
+        components (assoc (h/components) :watched-files-chan watched)
+        cleared* (atom [])]
+    (swap! db* assoc :project-root-uri (h/file-uri "file:///"))
+    (h/load-code-and-locs "(ns a) (def old 1)" uri)
+    (f.file-management/did-change-watched-files [{:uri uri :type :deleted}] components)
+    (let [deletion (h/take-or-timeout watched 1000)]
+      (h/load-code-and-locs "(ns a) (def unsaved 2)" uri)
+      (let [new-session (get-in @db* [:documents uri :open-session])]
+        (with-redefs [diagnostics/publish-empty-diagnostics! (fn [uris _] (swap! cleared* into uris))]
+          (f.file-management/analyze-watched-files! [deletion] components))
+        (is (empty? @cleared*))
+        (is (= new-session (get-in @db* [:documents uri :open-session])))
+        (is (= "(ns a) (def unsaved 2)" (get-in @db* [:documents uri :text])))
+        (is (= 'unsaved (get-in @db* [:analysis uri :var-definitions 0 :name])))
+        (f.file-management/did-change-watched-files [{:uri uri :type :created}] components)
+        (f.file-management/analyze-watched-files! [(h/take-or-timeout watched 1000)] components)
+        (is (= new-session (get-in @db* [:documents uri :open-session])))
+        (is (= "(ns a) (def unsaved 2)" (get-in @db* [:documents uri :text])))
+        (is (= 'unsaved (get-in @db* [:analysis uri :var-definitions 0 :name])))))))
+
+(deftest closed-files-refresh-text-before-diagnostics
+  (doseq [race [:none :reopen :close]]
+    (testing (name race)
+      (h/reset-components!)
+      (let [root (fs/create-temp-dir {:prefix "clojure-lsp-closed-"})
+            path (str (fs/path root "a.clj"))
+            db* (h/db*)
+            uri (shared/filename->uri path @db*)
+            old-text "(ns a) #_{:clojure-lsp/ignore [:clojure-lsp/unused-public-var]} (def old 1)"
+            disk-text "(ns a) (def fresh 2)"
+            editor-text "(ns a) (def unsaved 3)"
+            original-kondo kondo/run-kondo-on-text!
+            runs* (atom 0)]
+        (try
+          (swap! db* assoc :project-root-uri (shared/filename->uri (str root) @db*)
+                 :settings {:source-paths #{(str root)}})
+          (spit path old-text)
+          (h/load-code-and-locs old-text uri)
+          ;; :close changes the session state while a reference analysis runs;
+          ;; the other cases start with an already closed, retained document.
+          (when (not= race :close) (f.file-management/did-close uri (h/components)))
+          (spit path disk-text)
+          (with-redefs [kondo/run-kondo-on-text!
+                        (fn [text uri snapshot*]
+                          (let [result (original-kondo text uri snapshot*)]
+                            (when (= 1 (swap! runs* inc))
+                              (case race
+                                :reopen (f.file-management/load-document! uri editor-text db*)
+                                :close (f.file-management/did-close uri (h/components))
+                                nil))
+                            result))]
+            (if (= race :close)
+              (f.file-management/analyze-reference-uris! [uri] db*)
+              (f.file-management/analyze-watched-files! [{:uri uri :type :changed}] (h/components))))
+          (let [expected (if (= race :reopen) editor-text disk-text)]
+            (is (= expected (get-in @db* [:documents uri :text])))
+            (is (= expected (z/root-string (parser/safe-zloc-of-file @db* uri))))
+            (is (some #(= "clojure-lsp/unused-public-var" (:code %))
+                      (get-in @db* [:diagnostics :built-in uri])))
+            (is (= (not= race :reopen) (get-in @db* [:documents uri :closed?]))))
+          (finally (fs/delete-tree root)))))))
+
+(deftest queued-deletion-validates-the-session-inside-the-atom-update
+  (let [uri h/default-uri
+        db* (h/db*)
+        watched (async/chan 1)
+        components (assoc (h/components) :watched-files-chan watched)
+        original-remove kondo/db-without-uris
+        removals* (atom 0)
+        cleared* (atom [])]
+    (swap! db* assoc :project-root-uri (h/file-uri "file:///"))
+    (h/load-code-and-locs "(ns a) (def old 1)" uri)
+    (f.file-management/did-change-watched-files [{:uri uri :type :deleted}] components)
+    (let [deletion (h/take-or-timeout watched 1000)]
+      (with-redefs [kondo/db-without-uris
+                    (fn [state uris]
+                      (when (= 1 (swap! removals* inc))
+                        ;; Force the atom update to retry against a newer session.
+                        (f.file-management/load-document! uri "(ns a) (def unsaved 2)" db*))
+                      (original-remove state uris))
+                    diagnostics/publish-empty-diagnostics! (fn [uris _] (swap! cleared* into uris))]
+        (f.file-management/analyze-watched-files! [deletion] components)))
+    (is (empty? @cleared*))
+    (is (= "(ns a) (def unsaved 2)" (get-in @db* [:documents uri :text])))
+    (is (get-in @db* [:analysis uri]))))

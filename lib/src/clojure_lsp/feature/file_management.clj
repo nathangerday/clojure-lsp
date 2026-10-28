@@ -21,6 +21,79 @@
 
 (set! *warn-on-reflection* true)
 
+(defn- analysis-inputs [db]
+  {:settings (settings/all db)
+   :project-root-uri (:project-root-uri db)
+   :kondo-config (:kondo-config db)
+   :kondo-config-hash (:kondo-config-hash db)
+   :classpath (:classpath db)
+   :analysis (:analysis db)
+   :dep-graph (:dep-graph db)})
+
+(defn- same-analysis-inputs? [a b]
+  ;; Compare the potentially huge analysis by identity: a dependency/source
+  ;; analysis change conservatively requires a fresh run. Cursor, progress,
+  ;; document bookkeeping and other unrelated updates do not.
+  (and (identical? (:analysis a) (:analysis b))
+       (identical? (:dep-graph a) (:dep-graph b))
+       (= (dissoc a :analysis :dep-graph) (dissoc b :analysis :dep-graph))))
+
+(defn- commit-analysis!
+  "Calculate against a snapshot, reusing work only while its inputs remain valid.
+  The CAS only publishes a prepared state; expensive linters never run in swap!."
+  [db* {:keys [uris analyze valid? finish custom? documents?]
+        :or {valid? (constantly true) finish identity}}]
+  (loop [state-db @db* previous nil]
+    (when (valid? state-db)
+      (let [inputs (analysis-inputs state-db)
+            same-inputs? (and previous (same-analysis-inputs? inputs (:inputs previous)))
+            same-documents? (identical? (:documents state-db) (:documents previous))
+            reusable? (and same-inputs? (or (not documents?) same-documents?))
+            results (if reusable? (:results previous) (analyze (atom state-db)))
+            analyzed-uris (or (:uris results) uris)
+            candidate (cond-> (reduce lsp.kondo/db-with-results state-db (:kondo results))
+                        (contains? results :depend) (lsp.depend/db-with-results (:depend results)))
+            candidate (reduce-kv (fn [db uri text]
+                                   (assoc-in db [:documents uri :text] text))
+                                 candidate (:closed-texts results))
+            diagnostics (if (and reusable? same-documents?)
+                          (:diagnostics previous)
+                          {:built-in (case (count analyzed-uris)
+                                       0 {}
+                                       1 (f.diagnostics.built-in/analyze-uri! (first analyzed-uris) candidate)
+                                       (f.diagnostics.built-in/analyze-uris! analyzed-uris candidate))
+                           :custom (when custom?
+                                     (reduce (fn [diags uri]
+                                               (merge diags (f.diagnostics.custom/analyze-uri! uri candidate)))
+                                             {} analyzed-uris))})
+            candidate (cond-> (update-in candidate [:diagnostics :built-in] merge (:built-in diagnostics))
+                        custom? (update-in [:diagnostics :custom] merge (:custom diagnostics)))
+            candidate (finish candidate)]
+        (if (compare-and-set! db* state-db candidate)
+          {:before state-db :after candidate :uris analyzed-uris}
+          (recur @db* {:inputs inputs
+                       :documents (:documents state-db)
+                       :results results
+                       :diagnostics diagnostics}))))))
+
+(defn- analyze-document [uri text snapshot*]
+  (let [kondo-result* (future
+                        (shared/logging-task
+                          :internal/uri-analyzed-by-clj-kondo
+                          (lsp.kondo/run-kondo-on-text! text uri snapshot*)))
+        depend-result* (future
+                         (shared/logging-task
+                           :internal/uri-analyzed-by-clj-depend
+                           (lsp.depend/analyze-uri! uri @snapshot*)))]
+    {:kondo [@kondo-result*] :depend @depend-result*}))
+
+(defn- current-document? [db uri text version session]
+  (let [document (get-in db [:documents uri])]
+    (and (= version (:v document))
+         (= session (:open-session document))
+         (not (:closed? document))
+         (or (nil? (:text document)) (= text (:text document))))))
+
 (defn create-ns-changes [uri text db]
   (when-let [new-ns (and (string/blank? text)
                          (shared/uri->safe-namespace uri db))]
@@ -39,22 +112,16 @@
            :text text :saved-on-disk false :open-session session :closed? false)))
 
 (defn did-open [uri text {:keys [db* producer edits-chan] :as components} allow-create-ns]
-  (load-document! uri text db*)
-  (let [kondo-result* (future (lsp.kondo/run-kondo-on-text! text uri db*))
-        depend-result* (future (lsp.depend/analyze-uri! uri @db*))
-        kondo-result @kondo-result*
-        depend-result @depend-result*]
-    (swap! db* (fn [state-db]
-                 (-> state-db
-                     (lsp.kondo/db-with-results kondo-result)
-                     (lsp.depend/db-with-results depend-result)
-                     (f.diagnostics.built-in/db-with-results #(f.diagnostics.built-in/analyze-uri! uri %))
-                     (f.diagnostics.custom/db-with-results #(f.diagnostics.custom/analyze-uri! uri %))
-                     (assoc-in [:documents uri :analyzed-version] 0))))
-    (f.diagnostic/publish-diagnostics! uri components))
-  (when allow-create-ns
-    (when-let [create-ns-edits (create-ns-changes uri text @db*)]
-      (async/>!! edits-chan create-ns-edits)))
+  (let [session (get-in (load-document! uri text db*) [:documents uri :open-session])]
+    (when (commit-analysis! db* {:uris [uri]
+                                 :analyze #(analyze-document uri text %)
+                                 :valid? #(current-document? % uri text 0 session)
+                                 :custom? true
+                                 :finish #(assoc-in % [:documents uri :analyzed-version] 0)})
+      (f.diagnostic/publish-diagnostics! uri components)
+      (when allow-create-ns
+        (when-let [create-ns-edits (create-ns-changes uri text @db*)]
+          (async/>!! edits-chan create-ns-edits)))))
   (when (and (f.completion-lib/dep-file? uri)
              (not (:libs @f.completion-lib/libs*))
              (not (:api? @db*)))
@@ -138,61 +205,62 @@
                (or var-dependency-uris #{})
                (or kw-dependency-uris #{}))))
 
+(defn- analyze-files [uris snapshot* required-analysis-uris]
+  (let [db @snapshot*
+        uris (into [] (comp (distinct)
+                            (filter #(or (not (contains? required-analysis-uris %))
+                                         (contains? (:analysis db) %)))
+                            (filter #(let [document (get-in db [:documents %])]
+                                       (or (and (not (:closed? document)) (:text document))
+                                           (shared/file-exists? (io/file (shared/uri->filename %)))))))
+                   uris)
+        document-texts (into {} (keep (fn [uri]
+                                        (when-let [document (get-in db [:documents uri])]
+                                          (when-let [text (if (:closed? document)
+                                                            (shared/slurp-uri uri)
+                                                            (:text document))]
+                                            [uri text])))) uris)
+        closed-texts (into {} (filter (fn [[uri _]] (get-in db [:documents uri :closed?]))) document-texts)
+        disk-uris (into [] (remove #(contains? document-texts %)) uris)]
+    {:uris uris
+     ;; Refresh retained closed text before diagnostics/parser lookups. Analyze
+     ;; that same text, so ignore comments and kondo see the same file contents.
+     :closed-texts closed-texts
+     :kondo (cond-> (mapv (fn [[uri text]] (lsp.kondo/run-kondo-on-text! text uri snapshot*)) document-texts)
+              (seq disk-uris) (conj (lsp.kondo/run-kondo-on-reference-uris! disk-uris snapshot*)))}))
+
 (defn analyze-reference-uris!
-  "Re-analyze `uris` with clj-kondo and the built-in linters.
-
-  Open documents are linted from their in-memory text, so their unsaved changes
-  are kept, both in the analysis and in clj-kondo's cache. The other files are
-  linted from disk in a single batch."
+  "Re-analyze references once, using current editor text and validated snapshots."
   [uris db*]
-  (let [documents (:documents @db*)
-        open-uri->text (into {}
-                             (keep (fn [uri]
-                                     (when-let [text (get-in documents [uri :text])]
-                                       [uri text])))
-                             uris)
-        closed-uris (remove open-uri->text uris)
-        kondo-results (cond-> (mapv (fn [[uri text]]
-                                      (lsp.kondo/run-kondo-on-text! text uri db*))
-                                    open-uri->text)
-                        (seq closed-uris)
-                        (conj (lsp.kondo/run-kondo-on-reference-uris! closed-uris db*)))]
-    (swap! db* (fn [state-db]
-                 (-> (reduce lsp.kondo/db-with-results state-db kondo-results)
-                     (f.diagnostics.built-in/db-with-results #(f.diagnostics.built-in/analyze-uris! uris %)))))))
+  ;; Acquire the gate in the caller: never create a pool of tasks waiting for it.
+  ;; Other DB writers remain free to run; commit-analysis! validates their changes.
+  (locking db*
+    (let [db @db*
+          required-analysis-uris (into #{} (filter #(contains? (:analysis db) %)) uris)]
+      ;; Explicit callers may also request disk files not analyzed yet. Only
+      ;; previously known targets must remain present during publication retries.
+      (commit-analysis! db* {:uris uris :documents? true
+                             :analyze #(analyze-files uris % required-analysis-uris)}))))
 
-(defn ^:private notify-references [uri db-before db-after {:keys [db* producer] :as components}]
+(defn ^:private notify-references [changed-uris db-before db-after {:keys [db* producer] :as components}]
   (when (settings/get db-after [:notify-references-on-file-change] true)
-    (async/thread
-      (shared/logging-task
-        :internal/notify-references
-        (let [uris (shared/logging-task
-                     :reference-files/find
-                     (reference-uris uri db-before db-after))]
-          (when (seq uris)
-            (shared/logging-task
-              :reference-files/analyze
-              ;; TODO: We process the dependent and dependency files together, but
-              ;; it may be possible to be more efficient by processing them
-              ;; separately.
-              ;;
-              ;; The dependents may have been affected by changes to var
-              ;; definitions. Since some var definition data is copied to var
-              ;; usage data, this will change their analysis slightly. They may
-              ;; also gain or lose clj-kondo lint like unresolved-var or
-              ;; invalid-arity.
-              ;;
-              ;; The dependencies may have been affected by changes to var usages.
-              ;; Their analysis won't have changed, but they may gain or lose
-              ;; custom unused-public-var lint.
-              ;;
-              ;; So, we could send the dependents to kondo, bypassing custom-lint.
-              ;; And we could send the dependencies to custom-lint, bypassing
-              ;; kondo. See
-              ;; https://github.com/clojure-lsp/clojure-lsp/issues/1027 and
-              ;; https://github.com/clojure-lsp/clojure-lsp/issues/1028.
-              (analyze-reference-uris! uris db*))
-            (f.diagnostic/publish-all-diagnostics! uris true components)
+    (shared/logging-task
+      :internal/notify-references
+      (let [uris (shared/logging-task
+                   :reference-files/find
+                   (into #{}
+                         (comp
+                           (mapcat #(set/union (reference-uris % db-before db-after)
+                                               (reference-uris % db-after db-before)))
+                           ;; The reverse lookup finds old namespaces after deletion/rename.
+                           ;; Never reintroduce targets absent from the final analysis.
+                           (filter #(contains? (:analysis db-after) %)))
+                         changed-uris))]
+        (when (seq uris)
+          (let [result (shared/logging-task
+                         :reference-files/analyze
+                         (analyze-reference-uris! uris db*))]
+            (f.diagnostic/publish-all-diagnostics! (:uris result) true components)
             (producer/refresh-code-lens producer)))))))
 
 (defn ^:private offsets [lines line character end-line end-character]
@@ -268,58 +336,17 @@
     new-version
     old-version))
 
-(defn- analysis-inputs [db]
-  {:settings (settings/all db)
-   :project-root-uri (:project-root-uri db)
-   :kondo-config (:kondo-config db)
-   :kondo-config-hash (:kondo-config-hash db)
-   :classpath (:classpath db)
-   :analysis (:analysis db)})
-
-(defn- same-analysis-inputs? [a b]
-  ;; Compare the potentially huge analysis by identity: a dependency/source
-  ;; analysis change conservatively requires a fresh run. Cursor, progress,
-  ;; document bookkeeping and other unrelated updates do not.
-  (and (identical? (:analysis a) (:analysis b))
-       (= (dissoc a :analysis) (dissoc b :analysis))))
-
 (defn analyze-changes [{:keys [uri text version open-session]} {:keys [producer db*] :as components}]
-  (loop [state-db @db* previous-inputs nil previous-results nil]
-    (let [document (get-in state-db [:documents uri])]
-      (when (and (= version (:v document))
-                 (= open-session (:open-session document))
-                 (or (nil? (:text document)) (= text (:text document))))
-        (let [inputs (analysis-inputs state-db)
-              reusable? (and previous-results (same-analysis-inputs? inputs previous-inputs))
-              snapshot* (atom state-db)
-              kondo-result* (if reusable?
-                              (delay (:kondo previous-results))
-                              (future
-                                (shared/logging-task
-                                  :internal/uri-analyzed-by-clj-kondo
-                                  (lsp.kondo/run-kondo-on-text! text uri snapshot*))))
-              depend-result* (if reusable?
-                               (delay (:depend previous-results))
-                               (future
-                                 (shared/logging-task
-                                   :internal/uri-analyzed-by-clj-depend
-                                   (lsp.depend/analyze-uri! uri state-db))))
-              kondo-result @kondo-result*
-              depend-result @depend-result*
-              old-db @db*]
-          (if (compare-and-set! db* state-db
-                                (-> state-db
-                                    (lsp.kondo/db-with-results kondo-result)
-                                    (lsp.depend/db-with-results depend-result)
-                                    (f.diagnostics.built-in/db-with-results #(f.diagnostics.built-in/analyze-uri! uri %))
-                                    (f.diagnostics.custom/db-with-results #(f.diagnostics.custom/analyze-uri! uri %))
-                                    (update-in [:documents uri :analyzed-version]
-                                               bump-version version)))
-            (let [db @db*]
-              (f.diagnostic/publish-diagnostics! uri components)
-              (notify-references uri old-db db components)
-              (producer/refresh-test-tree producer [uri]))
-            (recur @db* inputs {:kondo kondo-result :depend depend-result})))))))
+  (when-let [{:keys [before after]}
+             (commit-analysis! db* {:uris [uri]
+                                    :analyze #(analyze-document uri text %)
+                                    :valid? #(current-document? % uri text version open-session)
+                                    :custom? true
+                                    :finish #(update-in % [:documents uri :analyzed-version]
+                                                        bump-version version)})]
+    (f.diagnostic/publish-diagnostics! uri components)
+    (notify-references [uri] before after components)
+    (producer/refresh-test-tree producer [uri])))
 
 (defn did-change [uri changes version {:keys [db* current-changes-chan]}]
   (let [state-db (swap! db* (fn [state-db]
@@ -333,46 +360,48 @@
                                      :version version
                                      :open-session (:open-session document)})))
 
-(defn ^:private db-without-uri [state-db uri]
-  (lsp.kondo/db-without-uris state-db [uri]))
+(defn- document-state [db uri]
+  (select-keys (get-in db [:documents uri]) [:open-session :v]))
+
+(defn- remove-files!
+  ([uris components] (remove-files! uris {} components))
+  ([uris expected-states {:keys [db*] :as components}]
+   (let [eligible (fn [db]
+                    (filterv #(or (not (contains? expected-states %))
+                                  (= (get expected-states %) (document-state db %))) uris))
+         [before _] (swap-vals! db* (fn [db]
+                                      (let [removed (eligible db)]
+                                        (-> (lsp.kondo/db-without-uris db removed)
+                                            (update-in [:diagnostics :built-in] #(apply dissoc % removed))
+                                            (update-in [:diagnostics :custom] #(apply dissoc % removed))))))
+         removed (eligible before)]
+     ;; Only an applied deletion may clear diagnostics. A queued old deletion
+     ;; must not erase a newer editor session or its unsaved text.
+     (f.diagnostic/publish-empty-diagnostics! removed components)
+     removed)))
 
 (defn ^:private files-deleted [old-db {:keys [db*] :as components} uris]
-  (swap! db* #(reduce db-without-uri % uris))
-  (f.diagnostic/publish-empty-diagnostics! uris components)
-  (into [] (keep #(notify-references % @db* old-db components)) uris))
+  (let [removed (remove-files! uris components)]
+    (notify-references removed old-db @db* components)))
 
-(defn ^:private analyze-files-on-disk! [uris {:keys [db* producer] :as components}]
+(defn analyze-watched-files!
+  "Apply the final event per URI, then analyze the union of affected references."
+  [changes {:keys [db* producer] :as components}]
   (let [old-db @db*
-        filenames (map shared/uri->filename uris)
-        kondo-result (lsp.kondo/run-kondo-on-paths! filenames db* {:external? false} nil)]
-    (swap! db* (fn [state-db]
-                 (-> state-db
-                     (lsp.kondo/db-with-results kondo-result)
-                     (f.diagnostics.built-in/db-with-results #(f.diagnostics.built-in/analyze-uris! uris %)))))
-    (f.diagnostic/publish-all-diagnostics! uris true components)
-    (producer/refresh-test-tree producer uris)
-    (doseq [uri uris]
-      (when (get-in @db* [:documents uri :v])
-        (when-let [text (shared/slurp-uri uri)]
-          (swap! db* assoc-in [:documents uri :text] text))))
-    (into [] (keep #(notify-references % old-db @db* components)) uris)))
-
-(defn analyze-watched-files! [changes {:keys [db*] :as components}]
-  (let [old-db @db*
-        ;; The last event per uri decides, so a file deleted and re-created
-        ;; within the debounce window is analyzed rather than removed, keeping
-        ;; the state of a document opened in the meantime.
-        uri->last-type (into {} (map (juxt :uri :type)) changes)
-        deleted-uris (into [] (keep (fn [[uri type]] (when (identical? :deleted type) uri))) uri->last-type)
-        existing-uris (into [] (comp (remove (fn [[_ type]] (identical? :deleted type)))
-                                     (map key)
-                                     (filter shared/uri-on-disk?))
-                            uri->last-type)
-        deletion-analyses (when (seq deleted-uris)
-                            (files-deleted old-db components deleted-uris))
-        reference-analyses (when (seq existing-uris)
-                             (analyze-files-on-disk! existing-uris components))]
-    (run! async/<!! (concat deletion-analyses reference-analyses))))
+        uri->event (into {} (map (juxt :uri identity)) changes)
+        deleted (into [] (keep (fn [[uri event]] (when (= :deleted (:type event)) uri))) uri->event)
+        expected-states (into {} (keep (fn [[uri event]]
+                                         (when (contains? event :document-state)
+                                           [uri (:document-state event)]))) uri->event)
+        surviving (into [] (comp (remove (fn [[_ event]] (= :deleted (:type event)))) (map key)) uri->event)
+        removed (when (seq deleted) (remove-files! deleted expected-states components))]
+    (when (seq surviving)
+      (let [result (commit-analysis! db* {:uris surviving :documents? true
+                                          :analyze #(analyze-files surviving % #{})})]
+        (f.diagnostic/publish-all-diagnostics! (:uris result) true components)
+        (producer/refresh-test-tree producer (:uris result))))
+    ;; Synchronous completion supplies backpressure to the watched-files consumer.
+    (notify-references (concat removed surviving) old-db @db* components)))
 
 (defn ^:private dir-or-file-uri->analyzable-uris [uri db]
   ;; If the URI is for an entire directory that has been created/deleted, we
@@ -396,9 +425,10 @@
   (let [db @db*
         observe-changed? (settings/get db [:compute-external-file-changes] true)]
     (doseq [{:keys [uri type]} changes
-            :when (or observe-changed? (not (identical? :changed type)))
+            :when (or observe-changed? (not= :changed type))
             analyzable-uri (dir-or-file-uri->analyzable-uris uri db)]
-      (async/>!! watched-files-chan {:uri analyzable-uri :type type}))))
+      (async/>!! watched-files-chan {:uri analyzable-uri :type type
+                                     :document-state (document-state db analyzable-uri)}))))
 
 (defn did-close [uri {:keys [db*] :as components}]
   ;; Keep cached text/analysis and the retired session's parse-cache protection,
